@@ -226,7 +226,7 @@ function Field({ label, value, onChange, type = "currency", min, max, step, hint
           onChange={handleChange}
           min={min} max={max} step={step || (type === "percent" ? 0.1 : type === "number" ? 1 : 1000)}
           className="w-full bg-slate-800/80 border border-slate-600/50 rounded-lg px-3 py-2.5 text-white text-right focus:outline-none focus:ring-2 focus:ring-amber-400/50 focus:border-amber-400/50 transition-all"
-          style={type === "currency" ? { paddingLeft: "1.5rem" } : {}}
+          style={type === "currency" ? { paddingLeft: "1.5rem" } : type === "percent" ? { paddingRight: "2rem" } : {}}
         />
         {type === "percent" && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-amber-400/60 text-sm">%</span>}
       </div>
