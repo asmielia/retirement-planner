@@ -256,16 +256,6 @@ function runProjection(inputs, strategy = "optimize") {
   const retRow = rows.find(r => r.age === retirementAge);
   const portfolioAtRet = retRow ? retRow.totalPortfolio : 0;
 
-  let pvDraws = 0;
-  for (const r of rows) {
-    if (r.age >= retirementAge && r.age <= lifeExpectancy) {
-      const totalDraw = r.savWd + r.nrWd + r.rrspWd + r.tfsaWd;
-      const yearsFromRet = r.age - retirementAge;
-      pvDraws += totalDraw / Math.pow(1 + postGrowth, yearsFromRet);
-    }
-  }
-  const fundingRatio = pvDraws > 0 ? portfolioAtRet / pvDraws : 999;
-
   // Surplus and estate value
   const lastRow = rows[rows.length - 1];
   const hasSurplus = lastRow && lastRow.totalPortfolio > 0;
@@ -288,7 +278,7 @@ function runProjection(inputs, strategy = "optimize") {
 
   return {
     rows, cppOptions, oasOptions, optCpp, optOas,
-    portfolioAtRet, pvDraws, fundingRatio, hasSurplus, estateValue,
+    portfolioAtRet, hasSurplus, estateValue,
     activeYears: Math.max(0, Math.min(70, lifeExpectancy) - retirementAge),
     slowdownYears: Math.max(0, Math.min(85, lifeExpectancy) - Math.max(70, retirementAge)),
     inactiveYears: Math.max(0, lifeExpectancy - Math.max(85, retirementAge)),
@@ -350,6 +340,29 @@ function runMaxEstate(inputs) {
     surplusMode: "max_estate",
     hasSurplus: true,
   };
+}
+
+// Find the max spending multiplier — this IS the funding ratio
+// 1.0 = exactly funded, 1.3 = can spend 30% more, 0.7 = can only afford 70%
+function findFundingRatio(inputs) {
+  let lo = 0.0, hi = 5.0;
+  for (let i = 0; i < 20; i++) {
+    const mid = (lo + hi) / 2;
+    const testInputs = {
+      ...inputs,
+      activeIncome: inputs.activeIncome * mid,
+      slowdownIncome: inputs.slowdownIncome * mid,
+      inactiveIncome: inputs.inactiveIncome * mid,
+    };
+    const result = runProjection(testInputs);
+    const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
+    if (endBal > 0) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return (lo + hi) / 2;
 }
 
 // ═══════════════════════════════════════════════
@@ -652,14 +665,13 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
       {results.hasSurplus && (
         <div className="bg-slate-800/60 border border-amber-400/30 rounded-xl p-5 mb-8">
           <div className="text-sm font-semibold text-amber-400 mb-1">
-            Your plan has a surplus of {fmtK(lastRow?.totalPortfolio)} at age {inputs.lifeExpectancy}
+            Your plan has a surplus — choose how to use it:
           </div>
-          <div className="text-xs text-slate-400 mb-4">Choose how to use the extra funds:</div>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="text-xs text-slate-400 mb-4">Your savings outlast your retirement. You can spend more each year or leave a larger inheritance.</div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {[
-              { key: "extend", label: "Keep as Buffer", icon: "🛡️", desc: "Leave surplus as a safety margin against living longer or market downturns" },
-              { key: "boost_spending", label: "Increase Spending", icon: "✈️", desc: "Proportionally increase retirement income so funds are fully used by end of life" },
               { key: "max_estate", label: "Maximize Estate", icon: "🏠", desc: "Optimize withdrawals to leave the largest possible post-tax inheritance" },
+              { key: "boost_spending", label: "Increase Spending", icon: "✈️", desc: "Proportionally increase retirement income so funds are fully used by end of life" },
             ].map(opt => (
               <button key={opt.key}
                 onClick={() => setSurplusMode(opt.key)}
@@ -918,24 +930,24 @@ const PAGES = [
 export default function App() {
   const [page, setPage] = useState(0);
   const [inputs, setInputs] = useState(DEFAULTS);
-  const [surplusMode, setSurplusMode] = useState("extend"); // "extend" | "boost_spending" | "max_estate"
+  const [surplusMode, setSurplusMode] = useState("max_estate"); // "boost_spending" | "max_estate"
 
   const setField = useCallback((key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
   }, []);
 
   const results = useMemo(() => {
+    const fundingRatio = findFundingRatio(inputs);
     const base = runProjection(inputs);
-    if (!base.hasSurplus || surplusMode === "extend") {
-      return { ...base, surplusMode: "extend" };
+
+    if (!base.hasSurplus) {
+      return { ...base, surplusMode: null, fundingRatio };
     }
     if (surplusMode === "boost_spending") {
-      return runBoostSpending(inputs);
+      return { ...runBoostSpending(inputs), fundingRatio };
     }
-    if (surplusMode === "max_estate") {
-      return runMaxEstate(inputs);
-    }
-    return { ...base, surplusMode: "extend" };
+    // Default: maximize estate
+    return { ...runMaxEstate(inputs), fundingRatio };
   }, [inputs, surplusMode]);
 
   const pages = [
