@@ -930,6 +930,7 @@ const PAGES = [
 
 const STORAGE_KEY = "retirement-planner-inputs";
 const SURPLUS_STORAGE_KEY = "retirement-planner-surplus-mode";
+const PAGE_STORAGE_KEY = "retirement-planner-page";
 
 function loadSavedInputs() {
   try {
@@ -952,7 +953,13 @@ function loadSurplusMode() {
 }
 
 export default function App() {
-  const [page, setPage] = useState(0);
+  const [page, setPage] = useState(() => {
+    try {
+      const saved = parseInt(localStorage.getItem(PAGE_STORAGE_KEY));
+      if (saved >= 0 && saved < PAGES.length) return saved;
+    } catch (e) { /* ignore */ }
+    return 0;
+  });
   const [inputs, setInputs] = useState(loadSavedInputs);
   const [surplusMode, setSurplusMode] = useState(loadSurplusMode);
 
@@ -970,6 +977,13 @@ export default function App() {
       localStorage.setItem(SURPLUS_STORAGE_KEY, surplusMode);
     } catch (e) { /* ignore */ }
   }, [surplusMode]);
+
+  // Persist current page
+  useEffect(() => {
+    try {
+      localStorage.setItem(PAGE_STORAGE_KEY, page);
+    } catch (e) { /* ignore */ }
+  }, [page]);
 
   const setField = useCallback((key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
