@@ -756,7 +756,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
         </div>
       </div>
       <Explanation>
-        The funding ratio compares your portfolio at retirement against the present value of all withdrawals you'll need to make from it. A ratio above 100% means your portfolio can sustain your desired lifestyle. The tax-optimized strategy considers your marginal tax rate each year and compares it to the projected rate at death to minimize total lifetime tax.
+        The funding ratio shows how much of your desired retirement spending your savings can support. 100% means your portfolio exactly covers your lifestyle through life expectancy. Above 100% means you could spend more or leave an estate. Below 100% means you'll need to reduce spending or save more.
       </Explanation>
     </div>
   );
