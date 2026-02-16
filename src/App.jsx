@@ -33,9 +33,33 @@ function calcProgressiveTax(income, bpa, brackets) {
 }
 
 // ═══════════════════════════════════════════════
+// TAX RATE HELPERS
+// ═══════════════════════════════════════════════
+function getMarginalRate(income, bpa, brackets) {
+  const taxable = Math.max(0, income - bpa);
+  for (const [threshold, rate] of brackets) {
+    if (taxable <= threshold - bpa) return rate;
+  }
+  return brackets[brackets.length - 1][1];
+}
+
+function getCombinedMarginalRate(income, fedBpa, fedBrackets, provBpa, provBrackets) {
+  return getMarginalRate(income, fedBpa, fedBrackets) + getMarginalRate(income, provBpa, provBrackets);
+}
+
+function estimateTerminalTaxRate(rrspBal, provData, fedBrackets, infFactor) {
+  // At death the full RRSP balance is deemed taxable income
+  const fedBpa = fedBrackets.bpa * infFactor;
+  const fedBrk = fedBrackets.brackets.map(([t, r]) => [t * infFactor, r]);
+  const provBpa = provData.bpa * infFactor;
+  const provBrk = provData.brackets.map(([t, r]) => [t * infFactor, r]);
+  return getCombinedMarginalRate(rrspBal, fedBpa, fedBrk, provBpa, provBrk);
+}
+
+// ═══════════════════════════════════════════════
 // CORE PROJECTION ENGINE
 // ═══════════════════════════════════════════════
-function runProjection(inputs) {
+function runProjection(inputs, strategy = "optimize") {
   const { currentAge, retirementAge, lifeExpectancy, province,
     rrspBal, tfsaBal, nonRegBal, savingsBal,
     rrspContrib, tfsaContrib, nonRegContrib, savingsContrib,
@@ -101,29 +125,100 @@ function runProjection(inputs) {
 
     // OAS clawback threshold (nominal)
     const oasThreshNom = oasClawbackThreshold * infFactor;
-    const rrspCap = Math.max(0, oasThreshNom - cpp - oasGross);
+
+    // Tax bracket info for this year
+    const fedBpa = fedBrackets.bpa * infFactor;
+    const fedBrk = fedBrackets.brackets.map(([t, r]) => [t * infFactor, r]);
+    const provBpa = provData.bpa * infFactor;
+    const provBrk = provData.brackets.map(([t, r]) => [t * infFactor, r]);
 
     let savWd = 0, nrWd = 0, rrspWd = 0, tfsaWd = 0;
     if (isRetired) {
-      // 1. Savings first
-      savWd = Math.min(savAvail, portfolioNeed);
+      // ── Tax-aware withdrawal allocation ──
+
+      // Step 1: Cash savings first (no growth, no tax cost)
+      // Maintain a cash floor of 2 months' spending as a safety net
+      const monthlySpending = desiredNominal / 12;
+      const cashFloor = monthlySpending * 2;
+      const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
+      savWd = Math.min(savAvailAfterFloor, portfolioNeed);
       let rem = portfolioNeed - savWd;
-      // 2. Non-Reg
+
+      // Step 2: RRSP — fill low tax brackets up to OAS clawback threshold
+      const lockedIncome = cpp + oasGross;
+      const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+      rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+      rem -= rrspWd;
+
+      // Step 3: Non-registered (50% capital gains inclusion — moderate tax cost)
       nrWd = Math.min(nonRegAvail, rem);
       rem -= nrWd;
-      // 3. RRSP (capped for OAS)
-      rrspWd = Math.min(rrspAvail, rem, rrspCap);
-      rem -= rrspWd;
-      // 4. TFSA
+
+      // Step 4: TFSA last (preserve tax-free compounding)
       tfsaWd = Math.min(tfsaAvail, rem);
+      rem -= tfsaWd;
+
+      // Step 5: If still short, dip into the cash floor as a last resort
+      if (rem > 0) {
+        const extraSav = Math.min(savAvail - savWd, rem);
+        savWd += extraSav;
+        rem -= extraSav;
+      }
+
+      // ── RRSP top-up: draw extra RRSP if current marginal rate < terminal rate ──
+      // This reduces the RRSP balance that would be fully taxed at death
+      if (strategy === "optimize" || strategy === "max_estate") {
+        const yearsToEnd = lifeExpectancy - age;
+        const currentRrspIncome = lockedIncome + rrspWd;
+        const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
+        const rrspAfterWd = rrspAvail - rrspWd;
+        const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrackets, infFactor);
+
+        let extraRrsp = 0;
+        if (strategy === "max_estate" && yearsToEnd > 0) {
+          // For estate maximization: spread RRSP evenly across remaining years
+          const annualTarget = rrspAfterWd / yearsToEnd;
+          extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
+          // But still cap at OAS threshold to avoid clawback
+          const totalRrspWithExtra = rrspWd + extraRrsp;
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+          // For optimize: fill up to the point where marginal rate matches terminal rate
+          // Find the income level where marginal rate jumps above terminal rate
+          let testIncome = currentRrspIncome;
+          for (const [threshold] of fedBrk) {
+            const bracketEdge = threshold;
+            if (bracketEdge > testIncome) {
+              const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
+              if (rateAtEdge >= terminalRate) {
+                extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                break;
+              }
+              testIncome = bracketEdge;
+            }
+          }
+          extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+          // Still respect OAS threshold
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        }
+
+        if (extraRrsp > 0) {
+          rrspWd += extraRrsp;
+          // Extra RRSP withdrawn beyond spending need goes to savings (cash buffer)
+          // This is taxed now at a lower rate instead of at death at a higher rate
+        }
+      }
     }
 
     // Update balances
     if (isRetired) {
+      const extraCash = Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed);
       rrsp = Math.max(0, rrspAvail - rrspWd);
       tfsa = Math.max(0, tfsaAvail - tfsaWd);
       nonReg = Math.max(0, nonRegAvail - nrWd);
-      savings = Math.max(0, savAvail - savWd);
+      savings = Math.max(0, savAvail - savWd + extraCash); // excess goes to cash
     } else {
       rrsp = rrsp * (1 + preGrowth) + rrspContrib;
       tfsa = tfsa * (1 + preGrowth) + tfsaContrib;
@@ -134,15 +229,9 @@ function runProjection(inputs) {
     const totalPortfolio = rrsp + tfsa + nonReg + savings;
 
     // Taxable income: RRSP withdrawal + CPP + OAS + NonReg growth (50% inclusion)
-    const nrGrowthTaxable = isRetired ? (nonReg > 0 ? (nonRegAvail - (nonReg + nrWd)) * 0 + nonRegAvail * postGrowth * 0.5 : 0) : 0;
     const taxableIncome = isRetired ? rrspWd + cpp + oasGross + Math.max(0, nonRegAvail * postGrowth * 0.5) : 0;
 
     // Tax calculation
-    const fedBpa = fedBrackets.bpa * infFactor;
-    const fedBrk = fedBrackets.brackets.map(([t, r]) => [t * infFactor, r]);
-    const provBpa = provData.bpa * infFactor;
-    const provBrk = provData.brackets.map(([t, r]) => [t * infFactor, r]);
-
     const fedTax = isRetired ? calcProgressiveTax(taxableIncome, fedBpa, fedBrk) : 0;
     const provTax = isRetired ? calcProgressiveTax(taxableIncome, provBpa, provBrk) : 0;
     const totalTax = fedTax + provTax;
@@ -177,12 +266,89 @@ function runProjection(inputs) {
   }
   const fundingRatio = pvDraws > 0 ? portfolioAtRet / pvDraws : 999;
 
+  // Surplus and estate value
+  const lastRow = rows[rows.length - 1];
+  const hasSurplus = lastRow && lastRow.totalPortfolio > 0;
+
+  // Post-tax estate value estimate
+  let estateValue = null;
+  if (lastRow) {
+    const finalInfFactor = Math.pow(1 + inflation, rows.length);
+    const termRate = estimateTerminalTaxRate(lastRow.rrsp, provData, fedBrackets, finalInfFactor);
+    const nrTaxRate = termRate * 0.5; // 50% inclusion on capital gains
+    estateValue = {
+      tfsa: lastRow.tfsa,
+      savings: lastRow.savings,
+      nonReg: lastRow.nonReg * (1 - nrTaxRate * 0.3), // approximate: ~30% of balance is gains
+      rrsp: lastRow.rrsp * (1 - termRate),
+      total: 0,
+    };
+    estateValue.total = estateValue.tfsa + estateValue.savings + estateValue.nonReg + estateValue.rrsp;
+  }
+
   return {
     rows, cppOptions, oasOptions, optCpp, optOas,
-    portfolioAtRet, pvDraws, fundingRatio,
+    portfolioAtRet, pvDraws, fundingRatio, hasSurplus, estateValue,
     activeYears: Math.max(0, Math.min(70, lifeExpectancy) - retirementAge),
     slowdownYears: Math.max(0, Math.min(85, lifeExpectancy) - Math.max(70, retirementAge)),
     inactiveYears: Math.max(0, lifeExpectancy - Math.max(85, retirementAge)),
+  };
+}
+
+// ═══════════════════════════════════════════════
+// SURPLUS MODE FUNCTIONS
+// ═══════════════════════════════════════════════
+function runBoostSpending(inputs) {
+  // Binary search for a spending multiplier that depletes portfolio at life expectancy
+  let lo = 1.0, hi = 5.0;
+  let bestResult = null;
+
+  for (let i = 0; i < 25; i++) {
+    const mid = (lo + hi) / 2;
+    const boostedInputs = {
+      ...inputs,
+      activeIncome: inputs.activeIncome * mid,
+      slowdownIncome: inputs.slowdownIncome * mid,
+      inactiveIncome: inputs.inactiveIncome * mid,
+    };
+    const result = runProjection(boostedInputs);
+    const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
+
+    if (endBal > 1000) { // small buffer to avoid oscillation
+      lo = mid;
+      bestResult = result;
+    } else {
+      hi = mid;
+    }
+  }
+
+  const multiplier = (lo + hi) / 2;
+  // Run final projection at the converged multiplier
+  const finalInputs = {
+    ...inputs,
+    activeIncome: inputs.activeIncome * multiplier,
+    slowdownIncome: inputs.slowdownIncome * multiplier,
+    inactiveIncome: inputs.inactiveIncome * multiplier,
+  };
+  const finalResult = runProjection(finalInputs);
+
+  return {
+    ...finalResult,
+    surplusMode: "boost_spending",
+    hasSurplus: true,
+    spendingMultiplier: multiplier,
+    boostedActiveIncome: inputs.activeIncome * multiplier,
+    boostedSlowdownIncome: inputs.slowdownIncome * multiplier,
+    boostedInactiveIncome: inputs.inactiveIncome * multiplier,
+  };
+}
+
+function runMaxEstate(inputs) {
+  const result = runProjection(inputs, "max_estate");
+  return {
+    ...result,
+    surplusMode: "max_estate",
+    hasSurplus: true,
   };
 }
 
@@ -343,7 +509,7 @@ function Page2_Balances({ inputs, setField }) {
         </div>
       </div>
       <Explanation>
-        We'll draw from these accounts in a tax-optimized order: cash savings first (no growth benefit), then non-registered (taxable growth), then RRSP (capped to avoid OAS clawback), and TFSA last (preserving tax-free compounding as long as possible).
+        We use a tax-aware withdrawal strategy: cash savings first (no growth benefit), then RRSP to fill low tax brackets (capped at the OAS clawback threshold), then non-registered (50% capital gains inclusion), and TFSA last (preserving tax-free compounding). If your current marginal tax rate is lower than the projected rate at death, extra RRSP is drawn now to reduce the future tax burden on your estate.
       </Explanation>
     </div>
   );
@@ -460,7 +626,7 @@ function Page5_CPP({ inputs, setField, results }) {
   );
 }
 
-function Page6_Results({ inputs, results }) {
+function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
   const status = results.fundingRatio >= 1 ? { icon: "✅", text: "Plan is On Track", color: "text-emerald-400" }
     : results.fundingRatio >= 0.7 ? { icon: "⚠️", text: "Needs Improvement", color: "text-amber-400" }
     : { icon: "❌", text: "Plan is Unrealistic", color: "text-red-400" };
@@ -482,6 +648,73 @@ function Page6_Results({ inputs, results }) {
         <div className="text-slate-400 text-sm mt-1">Funding Ratio: <span className="text-white font-semibold">{Math.round(results.fundingRatio * 100)}%</span></div>
       </div>
 
+      {/* Surplus mode toggle */}
+      {results.hasSurplus && (
+        <div className="bg-slate-800/60 border border-amber-400/30 rounded-xl p-5 mb-8">
+          <div className="text-sm font-semibold text-amber-400 mb-1">
+            Your plan has a surplus of {fmtK(lastRow?.totalPortfolio)} at age {inputs.lifeExpectancy}
+          </div>
+          <div className="text-xs text-slate-400 mb-4">Choose how to use the extra funds:</div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {[
+              { key: "extend", label: "Keep as Buffer", icon: "🛡️", desc: "Leave surplus as a safety margin against living longer or market downturns" },
+              { key: "boost_spending", label: "Increase Spending", icon: "✈️", desc: "Proportionally increase retirement income so funds are fully used by end of life" },
+              { key: "max_estate", label: "Maximize Estate", icon: "🏠", desc: "Optimize withdrawals to leave the largest possible post-tax inheritance" },
+            ].map(opt => (
+              <button key={opt.key}
+                onClick={() => setSurplusMode(opt.key)}
+                className={`rounded-lg p-4 border text-left transition-all ${
+                  surplusMode === opt.key
+                    ? "bg-amber-400/15 border-amber-400/50 text-white"
+                    : "bg-slate-800/40 border-slate-700/40 text-slate-400 hover:border-slate-600"
+                }`}>
+                <div className="text-lg mb-1">{opt.icon}</div>
+                <div className="text-sm font-semibold">{opt.label}</div>
+                <div className="text-xs mt-1 leading-relaxed">{opt.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Boosted spending display */}
+      {surplusMode === "boost_spending" && results.spendingMultiplier && (
+        <div className="mb-8">
+          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Boosted Retirement Income (Today's $)</h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <StatCard label={`Active Phase (${inputs.retirementAge}–70)`}
+              value={fmt(Math.round(results.boostedActiveIncome))}
+              sub={`was ${fmt(inputs.activeIncome)} (+${Math.round((results.spendingMultiplier - 1) * 100)}%)`} accent />
+            <StatCard label="Slowdown Phase (70–85)"
+              value={fmt(Math.round(results.boostedSlowdownIncome))}
+              sub={`was ${fmt(inputs.slowdownIncome)} (+${Math.round((results.spendingMultiplier - 1) * 100)}%)`} accent />
+            <StatCard label="Inactive Phase (85+)"
+              value={fmt(Math.round(results.boostedInactiveIncome))}
+              sub={`was ${fmt(inputs.inactiveIncome)} (+${Math.round((results.spendingMultiplier - 1) * 100)}%)`} accent />
+          </div>
+          <Explanation>
+            By increasing your spending by {Math.round((results.spendingMultiplier - 1) * 100)}% across all phases, your portfolio is projected to be fully utilized by age {inputs.lifeExpectancy}. These amounts are in today's dollars and will be inflation-adjusted each year.
+          </Explanation>
+        </div>
+      )}
+
+      {/* Estate value display */}
+      {surplusMode === "max_estate" && results.estateValue && (
+        <div className="mb-8">
+          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Estimated Post-Tax Estate Value</h3>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <StatCard label="TFSA (tax-free)" value={fmtK(results.estateValue.tfsa)} accent />
+            <StatCard label="Cash Savings" value={fmtK(results.estateValue.savings)} />
+            <StatCard label="Non-Reg (after tax)" value={fmtK(results.estateValue.nonReg)} />
+            <StatCard label="RRSP (after tax)" value={fmtK(results.estateValue.rrsp)} />
+            <StatCard label="Total Estate" value={fmtK(results.estateValue.total)} accent />
+          </div>
+          <Explanation>
+            The estate strategy aggressively draws down your RRSP during retirement at lower tax brackets, preserving your TFSA (which passes tax-free to beneficiaries). At death, any remaining RRSP is fully taxable as income on the final tax return. Estate values shown are after estimated taxes. Actual values depend on factors like surviving spouse (RRSP rollover), province of death, and executor decisions.
+          </Explanation>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         <StatCard label="Portfolio at Retirement" value={fmtK(results.portfolioAtRet)} accent />
         <StatCard label="Portfolio at End" value={fmtK(lastRow?.totalPortfolio)} sub={`Age ${inputs.lifeExpectancy}`} />
@@ -491,11 +724,11 @@ function Page6_Results({ inputs, results }) {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
-          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Withdrawal Strategy</h3>
+          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Tax-Optimized Withdrawal Strategy</h3>
           <div className="space-y-2 text-sm text-slate-300">
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">1.</span><span><strong className="text-white">Cash savings first</strong> — no growth benefit, so spend it early</span></div>
-            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">Non-registered next</strong> — investment growth is taxable anyway</span></div>
-            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">3.</span><span><strong className="text-white">RRSP third</strong> — fully taxable, but capped to stay under the OAS clawback threshold</span></div>
+            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">RRSP to fill low brackets</strong> — drawn up to OAS clawback threshold, plus extra if your current tax rate is lower than the projected rate at death</span></div>
+            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">3.</span><span><strong className="text-white">Non-registered next</strong> — only 50% of capital gains are taxable</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">4.</span><span><strong className="text-white">TFSA last</strong> — completely tax-free, let it compound as long as possible</span></div>
           </div>
         </div>
@@ -511,7 +744,7 @@ function Page6_Results({ inputs, results }) {
         </div>
       </div>
       <Explanation>
-        The funding ratio compares your portfolio at retirement against the present value of all withdrawals you'll need to make from it. A ratio above 100% means your portfolio can sustain your desired lifestyle. CPP and OAS cover a significant portion of your retirement income, reducing what your portfolio needs to provide.
+        The funding ratio compares your portfolio at retirement against the present value of all withdrawals you'll need to make from it. A ratio above 100% means your portfolio can sustain your desired lifestyle. The tax-optimized strategy considers your marginal tax rate each year and compares it to the projected rate at death to minimize total lifetime tax.
       </Explanation>
     </div>
   );
@@ -685,12 +918,25 @@ const PAGES = [
 export default function App() {
   const [page, setPage] = useState(0);
   const [inputs, setInputs] = useState(DEFAULTS);
+  const [surplusMode, setSurplusMode] = useState("extend"); // "extend" | "boost_spending" | "max_estate"
 
   const setField = useCallback((key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
   }, []);
 
-  const results = useMemo(() => runProjection(inputs), [inputs]);
+  const results = useMemo(() => {
+    const base = runProjection(inputs);
+    if (!base.hasSurplus || surplusMode === "extend") {
+      return { ...base, surplusMode: "extend" };
+    }
+    if (surplusMode === "boost_spending") {
+      return runBoostSpending(inputs);
+    }
+    if (surplusMode === "max_estate") {
+      return runMaxEstate(inputs);
+    }
+    return { ...base, surplusMode: "extend" };
+  }, [inputs, surplusMode]);
 
   const pages = [
     <Page1_Personal inputs={inputs} setField={setField} />,
@@ -698,7 +944,7 @@ export default function App() {
     <Page3_Income inputs={inputs} setField={setField} />,
     <Page4_Rates inputs={inputs} setField={setField} />,
     <Page5_CPP inputs={inputs} setField={setField} results={results} />,
-    <Page6_Results inputs={inputs} results={results} />,
+    <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} />,
     <Page7_Charts inputs={inputs} results={results} />,
   ];
 
