@@ -763,7 +763,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
   );
 }
 
-function Page7_Charts({ inputs, results }) {
+function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
   const retAge = inputs.retirementAge;
   const chartData = results.rows.map(r => ({
     age: r.age, portfolio: r.totalPortfolio, real: r.realPortfolio,
@@ -792,6 +792,32 @@ function Page7_Charts({ inputs, results }) {
     <div>
       <SectionTitle icon="📈" title="Detailed Projections"
         subtitle="Visual breakdowns of how your wealth grows, where your retirement income comes from, and how tax optimization protects your money." />
+
+      {/* Sticky surplus mode toggle */}
+      {results.hasSurplus && (
+        <div className="sticky top-[52px] z-40 -mx-4 px-4 py-3 bg-slate-900/95 backdrop-blur border-b border-slate-800/60 mb-6">
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-slate-400">Viewing projections for:</span>
+            <div className="flex gap-2">
+              {[
+                { key: "max_estate", label: "Maximize Estate", icon: "🏠" },
+                { key: "boost_spending", label: "Increase Spending", icon: "✈️" },
+              ].map(opt => (
+                <button key={opt.key}
+                  onClick={() => setSurplusMode(opt.key)}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-1.5 ${
+                    surplusMode === opt.key
+                      ? "bg-amber-400/15 text-amber-400 border border-amber-400/40"
+                      : "bg-slate-800/60 text-slate-400 border border-slate-700/40 hover:text-white hover:border-slate-600"
+                  }`}>
+                  <span>{opt.icon}</span>
+                  <span>{opt.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Chart 1: Portfolio */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
@@ -1010,7 +1036,7 @@ export default function App() {
     <Page4_Rates inputs={inputs} setField={setField} />,
     <Page5_CPP inputs={inputs} setField={setField} results={results} />,
     <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} />,
-    <Page7_Charts inputs={inputs} results={results} />,
+    <Page7_Charts inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} />,
   ];
 
   return (
