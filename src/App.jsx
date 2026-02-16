@@ -137,9 +137,9 @@ function runProjection(inputs, strategy = "optimize") {
       // ── Tax-aware withdrawal allocation ──
 
       // Step 1: Cash savings first (no growth, no tax cost)
-      // Maintain a cash floor of 2 months' spending as a safety net
-      const monthlySpending = desiredNominal / 12;
-      const cashFloor = monthlySpending * 2;
+      // For spend_down mode, drain cash aggressively (no floor needed since goal is full depletion)
+      // For other modes, maintain a cash floor of 2 months' spending as a safety net
+      const cashFloor = strategy === "spend_down" ? 0 : (desiredNominal / 12) * 2;
       const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
       savWd = Math.min(savAvailAfterFloor, portfolioNeed);
       let rem = portfolioNeed - savWd;
@@ -290,6 +290,7 @@ function runProjection(inputs, strategy = "optimize") {
 // ═══════════════════════════════════════════════
 function runBoostSpending(inputs) {
   // Binary search for a spending multiplier that depletes portfolio at life expectancy
+  // Use "spend_down" strategy to skip RRSP top-up — the goal is smooth spending, not tax optimization
   let lo = 1.0, hi = 5.0;
   let bestResult = null;
 
@@ -301,7 +302,7 @@ function runBoostSpending(inputs) {
       slowdownIncome: inputs.slowdownIncome * mid,
       inactiveIncome: inputs.inactiveIncome * mid,
     };
-    const result = runProjection(boostedInputs);
+    const result = runProjection(boostedInputs, "spend_down");
     const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
 
     if (endBal > 1000) { // small buffer to avoid oscillation
@@ -320,7 +321,7 @@ function runBoostSpending(inputs) {
     slowdownIncome: inputs.slowdownIncome * multiplier,
     inactiveIncome: inputs.inactiveIncome * multiplier,
   };
-  const finalResult = runProjection(finalInputs);
+  const finalResult = runProjection(finalInputs, "spend_down");
 
   return {
     ...finalResult,
@@ -927,10 +928,48 @@ const PAGES = [
   { title: "Charts", icon: "📈" },
 ];
 
+const STORAGE_KEY = "retirement-planner-inputs";
+const SURPLUS_STORAGE_KEY = "retirement-planner-surplus-mode";
+
+function loadSavedInputs() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Merge with defaults so new fields are always present
+      return { ...DEFAULTS, ...parsed, fedBrackets: DEFAULTS.fedBrackets };
+    }
+  } catch (e) { /* ignore corrupt data */ }
+  return DEFAULTS;
+}
+
+function loadSurplusMode() {
+  try {
+    const saved = localStorage.getItem(SURPLUS_STORAGE_KEY);
+    if (saved === "boost_spending" || saved === "max_estate") return saved;
+  } catch (e) { /* ignore */ }
+  return "max_estate";
+}
+
 export default function App() {
   const [page, setPage] = useState(0);
-  const [inputs, setInputs] = useState(DEFAULTS);
-  const [surplusMode, setSurplusMode] = useState("max_estate"); // "boost_spending" | "max_estate"
+  const [inputs, setInputs] = useState(loadSavedInputs);
+  const [surplusMode, setSurplusMode] = useState(loadSurplusMode);
+
+  // Persist inputs to localStorage
+  useEffect(() => {
+    try {
+      const { fedBrackets, ...rest } = inputs;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(rest));
+    } catch (e) { /* storage full or unavailable */ }
+  }, [inputs]);
+
+  // Persist surplus mode
+  useEffect(() => {
+    try {
+      localStorage.setItem(SURPLUS_STORAGE_KEY, surplusMode);
+    } catch (e) { /* ignore */ }
+  }, [surplusMode]);
 
   const setField = useCallback((key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
