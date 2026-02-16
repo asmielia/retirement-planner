@@ -927,10 +927,48 @@ const PAGES = [
   { title: "Charts", icon: "📈" },
 ];
 
+const STORAGE_KEY = "retirement-planner-inputs";
+const SURPLUS_STORAGE_KEY = "retirement-planner-surplus-mode";
+
+function loadSavedInputs() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Merge with defaults so new fields are always present
+      return { ...DEFAULTS, ...parsed, fedBrackets: DEFAULTS.fedBrackets };
+    }
+  } catch (e) { /* ignore corrupt data */ }
+  return DEFAULTS;
+}
+
+function loadSurplusMode() {
+  try {
+    const saved = localStorage.getItem(SURPLUS_STORAGE_KEY);
+    if (saved === "boost_spending" || saved === "max_estate") return saved;
+  } catch (e) { /* ignore */ }
+  return "max_estate";
+}
+
 export default function App() {
   const [page, setPage] = useState(0);
-  const [inputs, setInputs] = useState(DEFAULTS);
-  const [surplusMode, setSurplusMode] = useState("max_estate"); // "boost_spending" | "max_estate"
+  const [inputs, setInputs] = useState(loadSavedInputs);
+  const [surplusMode, setSurplusMode] = useState(loadSurplusMode);
+
+  // Persist inputs to localStorage
+  useEffect(() => {
+    try {
+      const { fedBrackets, ...rest } = inputs;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(rest));
+    } catch (e) { /* storage full or unavailable */ }
+  }, [inputs]);
+
+  // Persist surplus mode
+  useEffect(() => {
+    try {
+      localStorage.setItem(SURPLUS_STORAGE_KEY, surplusMode);
+    } catch (e) { /* ignore */ }
+  }, [surplusMode]);
 
   const setField = useCallback((key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
