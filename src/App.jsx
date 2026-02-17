@@ -157,15 +157,13 @@ function runProjection(inputs, strategy = "optimize") {
       const yearsToEnd = Math.max(1, lifeExpectancy - age);
 
       if (strategy === "optimize" || strategy === "max_estate") {
-        // Smooth RRSP drawdown: spread remaining RRSP evenly across remaining years
+        // Smooth RRSP drawdown: spread remaining RRSP evenly across remaining years.
         // This keeps taxable income in lower brackets rather than filling to the
         // OAS threshold every year then cliff-dropping to zero when RRSP runs out.
-        // Cap at OAS clawback threshold to avoid losing OAS benefits.
+        // The spending shortfall beyond the smooth RRSP target is filled by TFSA.
         const annualTarget = rrspAvail / yearsToEnd;
         const smoothRrsp = Math.min(annualTarget, maxRrspForOas);
-        // Use the smooth target for spending, but ensure we draw at least enough
-        // to cover spending need (up to OAS cap) if smooth target is too low
-        rrspWd = Math.min(rrspAvail, Math.max(smoothRrsp, Math.min(rem, maxRrspForOas)));
+        rrspWd = Math.min(rrspAvail, smoothRrsp);
       } else {
         // spend_down: simple fill up to OAS threshold
         rrspWd = Math.min(rrspAvail, rem, maxRrspForOas);
