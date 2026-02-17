@@ -151,32 +151,17 @@ function runProjection(inputs, strategy = "optimize") {
       savWd = Math.min(savAvailAfterFloor, portfolioNeed);
       let rem = portfolioNeed - savWd;
 
-      // Step 2: Determine RRSP withdrawal target
+      // Step 2: RRSP — fill low tax brackets up to OAS clawback threshold
       const lockedIncome = cpp + oasGross + pension + bridge + other;
-      const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
-      const yearsToEnd = Math.max(1, lifeExpectancy - age);
-
-      if (strategy === "optimize" || strategy === "max_estate") {
-        // Smooth RRSP drawdown: spread remaining RRSP evenly across remaining years
-        // This keeps taxable income in lower brackets rather than filling to the
-        // OAS threshold every year then cliff-dropping to zero when RRSP runs out.
-        // Cap at OAS clawback threshold to avoid losing OAS benefits.
-        const annualTarget = rrspAvail / yearsToEnd;
-        const smoothRrsp = Math.min(annualTarget, maxRrspForOas);
-        // Use the smooth target for spending, but ensure we draw at least enough
-        // to cover spending need (up to OAS cap) if smooth target is too low
-        rrspWd = Math.min(rrspAvail, Math.max(smoothRrsp, Math.min(rem, maxRrspForOas)));
-      } else {
-        // spend_down: simple fill up to OAS threshold
-        rrspWd = Math.min(rrspAvail, rem, maxRrspForOas);
-      }
-      rem -= Math.min(rrspWd, rem);
+      const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+      rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+      rem -= rrspWd;
 
       // Step 3: Non-registered (50% capital gains inclusion — moderate tax cost)
       nrWd = Math.min(nonRegAvail, rem);
       rem -= nrWd;
 
-      // Step 4: TFSA (tax-free — blends with RRSP to smooth tax burden)
+      // Step 4: TFSA last (preserve tax-free compounding)
       tfsaWd = Math.min(tfsaAvail, rem);
       rem -= tfsaWd;
 
@@ -185,6 +170,52 @@ function runProjection(inputs, strategy = "optimize") {
         const extraSav = Math.min(savAvail - savWd, rem);
         savWd += extraSav;
         rem -= extraSav;
+      }
+
+      // ── RRSP top-up: draw extra RRSP if current marginal rate < terminal rate ──
+      // This reduces the RRSP balance that would be fully taxed at death
+      if (strategy === "optimize" || strategy === "max_estate") {
+        const yearsToEnd = lifeExpectancy - age;
+        const currentRrspIncome = lockedIncome + rrspWd;
+        const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
+        const rrspAfterWd = rrspAvail - rrspWd;
+        const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrackets, infFactor);
+
+        let extraRrsp = 0;
+        if (strategy === "max_estate" && yearsToEnd > 0) {
+          // For estate maximization: spread RRSP evenly across remaining years
+          const annualTarget = rrspAfterWd / yearsToEnd;
+          extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
+          // But still cap at OAS threshold to avoid clawback
+          const totalRrspWithExtra = rrspWd + extraRrsp;
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+          // For optimize: fill up to the point where marginal rate matches terminal rate
+          // Find the income level where marginal rate jumps above terminal rate
+          let testIncome = currentRrspIncome;
+          for (const [threshold] of fedBrk) {
+            const bracketEdge = threshold;
+            if (bracketEdge > testIncome) {
+              const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
+              if (rateAtEdge >= terminalRate) {
+                extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                break;
+              }
+              testIncome = bracketEdge;
+            }
+          }
+          extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+          // Still respect OAS threshold
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        }
+
+        if (extraRrsp > 0) {
+          rrspWd += extraRrsp;
+          // Extra RRSP withdrawn beyond spending need goes to savings (cash buffer)
+          // This is taxed now at a lower rate instead of at death at a higher rate
+        }
       }
     }
 
@@ -252,19 +283,9 @@ function runProjection(inputs, strategy = "optimize") {
     estateValue.total = estateValue.tfsa + estateValue.savings + estateValue.nonReg + estateValue.rrsp;
   }
 
-  // Total lifetime tax: retirement taxes + terminal RRSP tax at death
-  const retirementTax = rows.filter(r => r.age >= retirementAge).reduce((s, r) => s + r.totalTax + r.oasClawback, 0);
-  const terminalRrspTax = lastRow ? (() => {
-    const finalInfFactor = Math.pow(1 + inflation, rows.length);
-    const rate = estimateTerminalTaxRate(lastRow.rrsp, provData, fedBrackets, finalInfFactor);
-    return lastRow.rrsp * rate;
-  })() : 0;
-  const totalLifetimeTax = retirementTax + terminalRrspTax;
-
   return {
     rows, cppOptions, oasOptions, optCpp, optOas,
     portfolioAtRet, hasSurplus, estateValue,
-    totalLifetimeTax, retirementTax, terminalRrspTax,
     activeYears: Math.max(0, Math.min(70, lifeExpectancy) - retirementAge),
     slowdownYears: Math.max(0, Math.min(85, lifeExpectancy) - Math.max(70, retirementAge)),
     inactiveYears: Math.max(0, lifeExpectancy - Math.max(85, retirementAge)),
@@ -735,12 +756,11 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
         </div>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         <StatCard label="Portfolio at Retirement" value={fmtK(results.portfolioAtRet)} accent />
         <StatCard label="Portfolio at End" value={fmtK(lastRow?.totalPortfolio)} sub={`Age ${inputs.lifeExpectancy}`} />
-        <StatCard label="Tax During Retirement" value={fmtK(results.retirementTax)} sub="Income tax + clawback" />
-        <StatCard label="Tax at Death (RRSP)" value={fmtK(results.terminalRrspTax)} sub={`On ${fmtK(lastRow?.rrsp)} remaining`} />
-        <StatCard label="Total Lifetime Tax" value={fmtK(results.totalLifetimeTax)} sub="Retirement + terminal" accent />
+        <StatCard label="Total Tax Paid" value={fmtK(totalTaxPaid)} sub="Over retirement" />
+        <StatCard label="OAS Clawback" value={totalClawback > 0 ? fmtK(totalClawback) : "$0"} sub={totalClawback > 0 ? "Lost to clawback" : "Fully avoided ✓"} accent={totalClawback === 0} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
@@ -748,9 +768,9 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Tax-Optimized Withdrawal Strategy</h3>
           <div className="space-y-2 text-sm text-slate-300">
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">1.</span><span><strong className="text-white">Cash savings first</strong> — no growth benefit, so spend it early</span></div>
-            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">RRSP smoothed over remaining years</strong> — spread evenly to stay in lower tax brackets, capped at OAS clawback threshold to avoid losing OAS</span></div>
+            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">RRSP to fill low brackets</strong> — drawn up to OAS clawback threshold, plus extra if your current tax rate is lower than the projected rate at death</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">3.</span><span><strong className="text-white">Non-registered next</strong> — only 50% of capital gains are taxable</span></div>
-            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">4.</span><span><strong className="text-white">TFSA fills the gap</strong> — blends with RRSP to meet spending needs while keeping taxes smooth</span></div>
+            <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">4.</span><span><strong className="text-white">TFSA last</strong> — completely tax-free, let it compound as long as possible</span></div>
           </div>
         </div>
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
