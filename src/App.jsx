@@ -650,13 +650,13 @@ function Page5_CPP({ inputs, setField, results }) {
         <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">Pension & Other Retirement Income</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
           <div>
-            <Field label="Annual Pension Income (Today's $)" value={inputs.pensionIncome} onChange={v => setField("pensionIncome", v)} hint="Employer defined-benefit pension. Taxed as regular income." />
+            <Field label="Annual Pension Income (Today's $)" value={inputs.pensionIncome} onChange={v => setField("pensionIncome", v)} hint="Employer defined-benefit pension. Taxed as regular income. Not adjusted for inflation." />
             {showBridge && (
-              <Field label="Pension Bridge Benefit (Today's $)" value={inputs.pensionBridge} onChange={v => setField("pensionBridge", v)} hint={`Extra annual amount paid from retirement until age 65 to cover the gap before CPP/OAS. Taxed as regular income.`} />
+              <Field label="Pension Bridge Benefit (Today's $)" value={inputs.pensionBridge} onChange={v => setField("pensionBridge", v)} hint={`Extra annual amount paid from retirement until age 65 to cover the gap before CPP/OAS. Taxed as regular income. Not adjusted for inflation.`} />
             )}
           </div>
           <div>
-            <Field label="Other Annual Retirement Income (Today's $)" value={inputs.otherIncome} onChange={v => setField("otherIncome", v)} hint="Rental income, part-time work, annuities, etc. Taxed as regular income." />
+            <Field label="Other Annual Retirement Income (Today's $)" value={inputs.otherIncome} onChange={v => setField("otherIncome", v)} hint="Rental income, part-time work, annuities, etc. Taxed as regular income. Adjusted for inflation." />
             <Explanation>
               Pension and other income are taxed the same as RRSP withdrawals (fully taxable as regular income). They also count toward the OAS clawback threshold.
               {showBridge && " The bridge benefit is only paid until age 65, when CPP and OAS typically begin."}
