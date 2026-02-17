@@ -64,6 +64,7 @@ function runProjection(inputs, strategy = "optimize") {
     rrspBal, tfsaBal, nonRegBal, savingsBal,
     rrspContrib, tfsaContrib, nonRegContrib, savingsContrib,
     activeIncome, slowdownIncome, inactiveIncome,
+    pensionIncome, pensionBridge, otherIncome,
     preGrowth, postGrowth, inflation,
     cppAt65, oasAt65, oasClawbackThreshold,
     fedBrackets } = inputs;
@@ -107,6 +108,11 @@ function runProjection(inputs, strategy = "optimize") {
     const cpp = age >= optCpp.age ? optCpp.annual * infFactor : 0;
     const oasGross = age >= optOas.age ? optOas.annual * infFactor : 0;
 
+    // Pension, bridge, and other income (all inflation-adjusted, only in retirement)
+    const pension = isRetired ? pensionIncome * infFactor : 0;
+    const bridge = (isRetired && age < 65) ? pensionBridge * infFactor : 0;
+    const other = isRetired ? otherIncome * infFactor : 0;
+
     // Desired income (nominal)
     let desiredBase = 0;
     if (isRetired) {
@@ -114,8 +120,8 @@ function runProjection(inputs, strategy = "optimize") {
     }
     const desiredNominal = desiredBase * infFactor;
 
-    // Portfolio need from savings
-    const portfolioNeed = Math.max(0, desiredNominal - cpp - oasGross);
+    // Portfolio need from savings (after all guaranteed income sources)
+    const portfolioNeed = Math.max(0, desiredNominal - cpp - oasGross - pension - bridge - other);
 
     // Available balances (with growth applied)
     const rrspAvail = rrsp * (1 + growthRate);
@@ -145,7 +151,7 @@ function runProjection(inputs, strategy = "optimize") {
       let rem = portfolioNeed - savWd;
 
       // Step 2: RRSP — fill low tax brackets up to OAS clawback threshold
-      const lockedIncome = cpp + oasGross;
+      const lockedIncome = cpp + oasGross + pension + bridge + other;
       const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
       rrspWd = Math.min(rrspAvail, rem, rrspRoom);
       rem -= rrspWd;
@@ -228,8 +234,8 @@ function runProjection(inputs, strategy = "optimize") {
 
     const totalPortfolio = rrsp + tfsa + nonReg + savings;
 
-    // Taxable income: RRSP withdrawal + CPP + OAS + NonReg growth (50% inclusion)
-    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + Math.max(0, nonRegAvail * postGrowth * 0.5) : 0;
+    // Taxable income: RRSP withdrawal + CPP + OAS + pension + bridge + other + NonReg growth (50% inclusion)
+    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + Math.max(0, nonRegAvail * postGrowth * 0.5) : 0;
 
     // Tax calculation
     const fedTax = isRetired ? calcProgressiveTax(taxableIncome, fedBpa, fedBrk) : 0;
@@ -240,11 +246,11 @@ function runProjection(inputs, strategy = "optimize") {
     const oasClawback = isRetired ? Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15)) : 0;
 
     // Net income
-    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross - totalTax - oasClawback : 0;
+    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback : 0;
 
     rows.push({
       year, age, phase, rrsp, tfsa, nonReg, savings,
-      cpp, oasGross, totalPortfolio,
+      cpp, oasGross, pension, bridge, other, totalPortfolio,
       contribution: isRetired ? 0 : rrspContrib + tfsaContrib + nonRegContrib + savingsContrib,
       desiredNominal, savWd, nrWd, rrspWd, tfsaWd,
       taxableIncome, totalTax, oasClawback, netIncome,
@@ -595,10 +601,11 @@ function Page4_Rates({ inputs, setField }) {
 }
 
 function Page5_CPP({ inputs, setField, results }) {
+  const showBridge = inputs.retirementAge < 65;
   return (
     <div>
-      <SectionTitle icon="🏛️" title="CPP & OAS Benefits"
-        subtitle="Canada's public pension programs form the foundation of your retirement income. We'll find the optimal age to start collecting based on your life expectancy." />
+      <SectionTitle icon="🏛️" title="CPP, OAS & Pension"
+        subtitle="Government benefits and employer pensions form the foundation of your retirement income. We'll find the optimal age to start collecting CPP and OAS based on your life expectancy." />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 mb-6">
         <div>
           <Field label="CPP Annual Amount at Age 65 (Today's $)" value={inputs.cppAt65} onChange={v => setField("cppAt65", v)} hint="2025 max: $17,196. Check your My Service Canada Account for your estimate." />
@@ -635,6 +642,26 @@ function Page5_CPP({ inputs, setField, results }) {
             <div className="text-slate-500">{fmtK(o.lifetime)}</div>
           </div>
         ))}
+      </div>
+
+      {/* Pension & Other Income */}
+      <div className="mt-8">
+        <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">Pension & Other Retirement Income</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
+          <div>
+            <Field label="Annual Pension Income (Today's $)" value={inputs.pensionIncome} onChange={v => setField("pensionIncome", v)} hint="Employer defined-benefit pension. Taxed as regular income." />
+            {showBridge && (
+              <Field label="Pension Bridge Benefit (Today's $)" value={inputs.pensionBridge} onChange={v => setField("pensionBridge", v)} hint={`Extra annual amount paid from retirement until age 65 to cover the gap before CPP/OAS. Taxed as regular income.`} />
+            )}
+          </div>
+          <div>
+            <Field label="Other Annual Retirement Income (Today's $)" value={inputs.otherIncome} onChange={v => setField("otherIncome", v)} hint="Rental income, part-time work, annuities, etc. Taxed as regular income." />
+            <Explanation>
+              Pension and other income are taxed the same as RRSP withdrawals (fully taxable as regular income). They also count toward the OAS clawback threshold.
+              {showBridge && " The bridge benefit is only paid until age 65, when CPP and OAS typically begin."}
+            </Explanation>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -746,13 +773,16 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
           </div>
         </div>
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
-          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Government Benefits</h3>
+          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Guaranteed Income</h3>
           <div className="space-y-2 text-sm text-slate-300">
             <div className="flex justify-between"><span>CPP starts at age</span><span className="text-white font-semibold">{results.optCpp.age}</span></div>
             <div className="flex justify-between"><span>CPP annual (today's $)</span><span className="text-white font-semibold">{fmt(results.optCpp.annual)}</span></div>
             <div className="flex justify-between"><span>OAS starts at age</span><span className="text-white font-semibold">{results.optOas.age}</span></div>
             <div className="flex justify-between"><span>OAS annual (today's $)</span><span className="text-white font-semibold">{fmt(results.optOas.annual)}</span></div>
-            <div className="flex justify-between border-t border-slate-700/40 pt-2"><span>Combined (today's $)</span><span className="text-amber-400 font-semibold">{fmt(results.optCpp.annual + results.optOas.annual)}/yr</span></div>
+            {inputs.pensionIncome > 0 && <div className="flex justify-between"><span>Pension (today's $)</span><span className="text-white font-semibold">{fmt(inputs.pensionIncome)}/yr</span></div>}
+            {inputs.pensionBridge > 0 && inputs.retirementAge < 65 && <div className="flex justify-between"><span>Bridge until 65 (today's $)</span><span className="text-white font-semibold">{fmt(inputs.pensionBridge)}/yr</span></div>}
+            {inputs.otherIncome > 0 && <div className="flex justify-between"><span>Other income (today's $)</span><span className="text-white font-semibold">{fmt(inputs.otherIncome)}/yr</span></div>}
+            <div className="flex justify-between border-t border-slate-700/40 pt-2"><span>Combined at 65+ (today's $)</span><span className="text-amber-400 font-semibold">{fmt(results.optCpp.annual + results.optOas.annual + inputs.pensionIncome + inputs.otherIncome)}/yr</span></div>
           </div>
         </div>
       </div>
@@ -768,7 +798,8 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
   const chartData = results.rows.map(r => ({
     age: r.age, portfolio: r.totalPortfolio, real: r.realPortfolio,
     rrsp: r.rrsp, tfsa: r.tfsa, nonReg: r.nonReg, savings: r.savings,
-    cpp: r.cpp, oas: r.oasGross, savWd: r.savWd, nrWd: r.nrWd, rrspWd: r.rrspWd, tfsaWd: r.tfsaWd,
+    cpp: r.cpp, oas: r.oasGross, pension: r.pension, bridge: r.bridge, other: r.other,
+    savWd: r.savWd, nrWd: r.nrWd, rrspWd: r.rrspWd, tfsaWd: r.tfsaWd,
     tax: r.totalTax, clawback: r.oasClawback, net: r.netIncome, desired: r.desiredNominal,
   }));
   const retData = chartData.filter(d => d.age >= retAge);
@@ -874,13 +905,16 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
             <Legend wrapperStyle={{ fontSize: 12 }} />
             <Bar dataKey="cpp" name="CPP" stackId="1" fill="#1e3a5f" />
             <Bar dataKey="oas" name="OAS" stackId="1" fill="#2563eb" />
+            <Bar dataKey="pension" name="Pension" stackId="1" fill="#0891b2" />
+            <Bar dataKey="bridge" name="Bridge" stackId="1" fill="#06b6d4" />
+            <Bar dataKey="other" name="Other" stackId="1" fill="#8b5cf6" />
             <Bar dataKey="savWd" name="Savings" stackId="1" fill="#eab308" />
             <Bar dataKey="nrWd" name="Non-Reg" stackId="1" fill="#22c55e" />
             <Bar dataKey="rrspWd" name="RRSP" stackId="1" fill="#dc2626" />
             <Bar dataKey="tfsaWd" name="TFSA" stackId="1" fill="#a855f7" />
           </BarChart>
         </ResponsiveContainer>
-        <Explanation>CPP and OAS (in blue) form the income foundation once they start. Before that, your portfolio carries the full load. The tax-optimized strategy keeps RRSP withdrawals moderate to avoid OAS clawback.</Explanation>
+        <Explanation>CPP, OAS, pension, and other guaranteed income form the foundation. The bridge benefit covers the gap before age 65. Portfolio withdrawals fill the remainder, with the tax-optimized strategy keeping RRSP withdrawals moderate to avoid OAS clawback.</Explanation>
       </div>
 
       {/* Chart 4: Tax Impact */}
@@ -908,7 +942,11 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
           <table className="w-full text-xs">
             <thead>
               <tr className="text-slate-400 border-b border-slate-700/50">
-                {["Age","Phase","Portfolio","CPP","OAS","Sav Wd","NR Wd","RRSP Wd","TFSA Wd","Taxable","Tax","Clawback","Net Income"].map(h => (
+                {["Age","Phase","Portfolio","CPP","OAS",
+                  ...(inputs.pensionIncome > 0 ? ["Pension"] : []),
+                  ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? ["Bridge"] : []),
+                  ...(inputs.otherIncome > 0 ? ["Other"] : []),
+                  "Sav Wd","NR Wd","RRSP Wd","TFSA Wd","Taxable","Tax","Clawback","Net Income"].map(h => (
                   <th key={h} className="px-2 py-2 text-right font-medium whitespace-nowrap">{h}</th>
                 ))}
               </tr>
@@ -918,7 +956,11 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
                 <tr key={r.age} className="border-b border-slate-800/50 hover:bg-slate-700/20">
                   <td className="px-2 py-1.5 text-white font-medium">{r.age}</td>
                   <td className="px-2 py-1.5 text-slate-400">{r.phase}</td>
-                  {[r.totalPortfolio,r.cpp,r.oasGross,r.savWd,r.nrWd,r.rrspWd,r.tfsaWd,r.taxableIncome,r.totalTax,r.oasClawback,r.netIncome].map((v,i) => (
+                  {[r.totalPortfolio,r.cpp,r.oasGross,
+                    ...(inputs.pensionIncome > 0 ? [r.pension] : []),
+                    ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? [r.bridge] : []),
+                    ...(inputs.otherIncome > 0 ? [r.other] : []),
+                    r.savWd,r.nrWd,r.rrspWd,r.tfsaWd,r.taxableIncome,r.totalTax,r.oasClawback,r.netIncome].map((v,i) => (
                     <td key={i} className="px-2 py-1.5 text-right text-slate-300">{fmtK(v)}</td>
                   ))}
                 </tr>
@@ -939,6 +981,7 @@ const DEFAULTS = {
   rrspBal: 50000, tfsaBal: 40000, nonRegBal: 20000, savingsBal: 15000,
   rrspContrib: 10000, tfsaContrib: 7000, nonRegContrib: 5000, savingsContrib: 3000,
   activeIncome: 70000, slowdownIncome: 55000, inactiveIncome: 40000,
+  pensionIncome: 0, pensionBridge: 0, otherIncome: 0,
   preGrowth: 0.06, postGrowth: 0.04, inflation: 0.02,
   cppAt65: 17196, oasAt65: 8908, oasClawbackThreshold: 95323,
   fedBrackets: FED_BRACKETS_DEFAULT,
