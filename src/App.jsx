@@ -151,32 +151,54 @@ function runProjection(inputs, strategy = "optimize") {
       savWd = Math.min(savAvailAfterFloor, portfolioNeed);
       let rem = portfolioNeed - savWd;
 
-      // Step 2: Determine RRSP withdrawal target
+      // Step 2: Determine withdrawal targets
       const lockedIncome = cpp + oasGross + pension + bridge + other;
       const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
       const yearsToEnd = Math.max(1, lifeExpectancy - age);
 
       if (strategy === "optimize" || strategy === "max_estate") {
-        // Smooth RRSP drawdown: spread remaining RRSP evenly across remaining years.
-        // This keeps taxable income in lower brackets rather than filling to the
-        // OAS threshold every year then cliff-dropping to zero when RRSP runs out.
-        // The spending shortfall beyond the smooth RRSP target is filled by TFSA.
-        const annualTarget = rrspAvail / yearsToEnd;
-        const smoothRrsp = Math.min(annualTarget, maxRrspForOas);
-        rrspWd = Math.min(rrspAvail, smoothRrsp);
+        // Smooth drawdown: spread both RRSP and TFSA evenly across remaining years.
+        // This avoids depleting one account early while the other lingers.
+        // RRSP is capped at OAS clawback threshold to preserve OAS benefits.
+        const smoothRrsp = Math.min(rrspAvail / yearsToEnd, maxRrspForOas);
+        const smoothTfsa = tfsaAvail / yearsToEnd;
+
+        // Draw smooth RRSP first (taxable but smoothed into low brackets)
+        rrspWd = Math.min(rrspAvail, smoothRrsp, rem);
+        rem -= rrspWd;
+
+        // Draw smooth TFSA (tax-free, also smoothed)
+        tfsaWd = Math.min(tfsaAvail, smoothTfsa, rem);
+        rem -= tfsaWd;
+
+        // If still short, draw extra from non-reg (50% cap gains — moderate tax)
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        // If still short, draw more RRSP up to OAS cap
+        if (rem > 0) {
+          const extraRrsp = Math.min(rrspAvail - rrspWd, maxRrspForOas - rrspWd, rem);
+          rrspWd += extraRrsp;
+          rem -= extraRrsp;
+        }
+
+        // If still short, draw more TFSA
+        if (rem > 0) {
+          const extraTfsa = Math.min(tfsaAvail - tfsaWd, rem);
+          tfsaWd += extraTfsa;
+          rem -= extraTfsa;
+        }
       } else {
-        // spend_down: simple fill up to OAS threshold
+        // spend_down: simple fill up to OAS threshold, then non-reg, then TFSA
         rrspWd = Math.min(rrspAvail, rem, maxRrspForOas);
+        rem -= rrspWd;
+
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
       }
-      rem -= Math.min(rrspWd, rem);
-
-      // Step 3: Non-registered (50% capital gains inclusion — moderate tax cost)
-      nrWd = Math.min(nonRegAvail, rem);
-      rem -= nrWd;
-
-      // Step 4: TFSA (tax-free — blends with RRSP to smooth tax burden)
-      tfsaWd = Math.min(tfsaAvail, rem);
-      rem -= tfsaWd;
 
       // Step 5: If still short, dip into the cash floor as a last resort
       if (rem > 0) {
