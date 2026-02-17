@@ -108,9 +108,10 @@ function runProjection(inputs, strategy = "optimize") {
     const cpp = age >= optCpp.age ? optCpp.annual * infFactor : 0;
     const oasGross = age >= optOas.age ? optOas.annual * infFactor : 0;
 
-    // Pension, bridge, and other income (all inflation-adjusted, only in retirement)
-    const pension = isRetired ? pensionIncome * infFactor : 0;
-    const bridge = (isRetired && age < 65) ? pensionBridge * infFactor : 0;
+    // Pension and bridge are fixed nominal amounts (most DB pensions are not indexed to inflation)
+    // Other income (rental, part-time, etc.) is inflation-adjusted
+    const pension = isRetired ? pensionIncome : 0;
+    const bridge = (isRetired && age < 65) ? pensionBridge : 0;
     const other = isRetired ? otherIncome * infFactor : 0;
 
     // Desired income (nominal)
