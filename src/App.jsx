@@ -1215,11 +1215,11 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Tax-Optimized Withdrawal Strategy</h3>
           <div className="space-y-2 text-sm text-slate-300">
-            {isCouple && <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">0.</span><span><strong className="text-white">Proportional split</strong> — when both partners are retired, withdrawals are split proportional to each partner's remaining portfolio</span></div>}
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">1.</span><span><strong className="text-white">Cash savings first</strong> — no growth benefit, so spend it early</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">RRSP to fill low brackets</strong> — drawn up to OAS clawback threshold, plus extra if your current tax rate is lower than the projected rate at death</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">3.</span><span><strong className="text-white">Non-registered next</strong> — only 50% of capital gains are taxable</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">4.</span><span><strong className="text-white">TFSA last</strong> — completely tax-free, let it compound as long as possible</span></div>
+            {isCouple && <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">•</span><span><strong className="text-white">Proportional split</strong> — when both partners are retired, withdrawals are split proportional to each partner's remaining portfolio</span></div>}
           </div>
         </div>
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
