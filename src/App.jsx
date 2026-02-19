@@ -1597,30 +1597,30 @@ export default function App() {
     return { ...runMaxEstate(inputs), fundingRatio };
   }, [inputs, surplusMode, isCouple]);
 
+  const scrollTop = () => setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 0);
+
   // Couple-aware navigation
   const handleNext = useCallback(() => {
     if (isCouple && currentPageDef?.perPerson && personTab === "you") {
       setPersonTab("partner");
-      window.scrollTo(0, 0);
     } else {
       setPage(p => Math.min(PAGES.length - 1, p + 1));
       if (isCouple) setPersonTab("you");
-      window.scrollTo(0, 0);
     }
+    scrollTop();
   }, [isCouple, currentPageDef, personTab]);
 
   const handleBack = useCallback(() => {
     if (isCouple && currentPageDef?.perPerson && personTab === "partner") {
       setPersonTab("you");
-      window.scrollTo(0, 0);
     } else {
       setPage(p => {
         const prev = Math.max(0, p - 1);
         if (isCouple && PAGES[prev]?.perPerson) setPersonTab("partner");
         return prev;
       });
-      window.scrollTo(0, 0);
     }
+    scrollTop();
   }, [isCouple, currentPageDef, personTab]);
 
   // Per-person helpers for current tab
@@ -1657,7 +1657,7 @@ export default function App() {
         <div className="max-w-5xl mx-auto px-4 py-3">
           <div className="flex items-center gap-1">
             {PAGES.map((p, i) => (
-              <button key={i} onClick={() => { setPage(i); setPersonTab("you"); }}
+              <button key={i} onClick={() => { setPage(i); setPersonTab("you"); scrollTop(); }}
                 className={`flex-1 flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium transition-all ${i === page ? "bg-amber-400/15 text-amber-400 border border-amber-400/30" : i < page ? "text-slate-400 hover:text-white" : "text-slate-600"}`}>
                 <span className="hidden sm:inline">{p.icon}</span>
                 <span className="hidden md:inline">{p.title}</span>
