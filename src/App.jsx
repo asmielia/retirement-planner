@@ -374,6 +374,412 @@ function findFundingRatio(inputs) {
 }
 
 // ═══════════════════════════════════════════════
+// COUPLE PROJECTION ENGINE
+// ═══════════════════════════════════════════════
+function buildPersonInputs(inputs, who) {
+  const p = who === "partner" ? inputs.partner : inputs;
+  return {
+    currentAge: p.currentAge, retirementAge: p.retirementAge, lifeExpectancy: p.lifeExpectancy,
+    employmentIncome: p.employmentIncome || 0,
+    rrspBal: p.rrspBal, tfsaBal: p.tfsaBal, nonRegBal: p.nonRegBal, savingsBal: p.savingsBal,
+    rrspContrib: p.rrspContrib, tfsaContrib: p.tfsaContrib, nonRegContrib: p.nonRegContrib, savingsContrib: p.savingsContrib,
+    pensionIncome: p.pensionIncome, pensionBridge: p.pensionBridge, otherIncome: p.otherIncome,
+    cppAt65: p.cppAt65, oasAt65: p.oasAt65, oasClawbackThreshold: p.oasClawbackThreshold,
+    // Shared fields
+    province: inputs.province, preGrowth: inputs.preGrowth, postGrowth: inputs.postGrowth,
+    inflation: inputs.inflation, fedBrackets: inputs.fedBrackets,
+    // Income targets (shared)
+    activeIncome: inputs.activeIncome, slowdownIncome: inputs.slowdownIncome, inactiveIncome: inputs.inactiveIncome,
+  };
+}
+
+function runCoupleProjection(inputs, strategy = "optimize") {
+  const you = buildPersonInputs(inputs, "you");
+  const partner = buildPersonInputs(inputs, "partner");
+  const provData = PROVINCES[inputs.province] || PROVINCES.Ontario;
+
+  // Run individual projections for CPP/OAS optimization data only
+  const youSolo = runProjection(you);
+  const partnerSolo = runProjection(partner);
+
+  // CPP/OAS optimization per person
+  const youOptCpp = youSolo.optCpp, youOptOas = youSolo.optOas;
+  const partnerOptCpp = partnerSolo.optCpp, partnerOptOas = partnerSolo.optOas;
+
+  // Time horizon: both partners share the same calendar years
+  // Total years from now until the latest life expectancy
+  const youYearsLeft = you.lifeExpectancy - you.currentAge;
+  const partnerYearsLeft = partner.lifeExpectancy - partner.currentAge;
+  const totalYears = Math.max(youYearsLeft, partnerYearsLeft) + 1;
+
+  const rows = [];
+  let yRrsp = you.rrspBal, yTfsa = you.tfsaBal, yNonReg = you.nonRegBal, ySav = you.savingsBal;
+  let pRrsp = partner.rrspBal, pTfsa = partner.tfsaBal, pNonReg = partner.nonRegBal, pSav = partner.savingsBal;
+
+  for (let year = 1; year <= totalYears; year++) {
+    const youAge = you.currentAge + (year - 1);
+    const partnerAge = partner.currentAge + (year - 1);
+    // Use "you" age as the chart x-axis reference
+    const yearAge = youAge;
+    const infFactor = Math.pow(1 + inputs.inflation, year);
+
+    const youAlive = youAge <= you.lifeExpectancy;
+    const partnerAlive = partnerAge <= partner.lifeExpectancy;
+    if (!youAlive && !partnerAlive) break;
+
+    const youRetired = youAlive && youAge >= you.retirementAge;
+    const partnerRetired = partnerAlive && partnerAge >= partner.retirementAge;
+
+    // Phase based on older alive partner's age
+    const olderAge = youAlive && partnerAlive ? Math.max(youAge, partnerAge) : (youAlive ? youAge : partnerAge);
+    const phase = olderAge < Math.max(you.retirementAge, partner.retirementAge) ? "Accumulation" : olderAge < 70 ? "Active" : olderAge < 85 ? "Slowdown" : "Inactive";
+
+    const growthRate = (youRetired || partnerRetired) ? inputs.postGrowth : inputs.preGrowth;
+
+    // Desired combined income
+    let desiredBase = 0;
+    if (youRetired || partnerRetired) {
+      desiredBase = olderAge < 70 ? inputs.activeIncome : olderAge < 85 ? inputs.slowdownIncome : inputs.inactiveIncome;
+    }
+    // Survivor: 60% of combined if one partner has passed
+    const bothAlive = youAlive && partnerAlive;
+    const survivorFactor = bothAlive ? 1.0 : 0.6;
+    const desiredNominal = desiredBase * infFactor * survivorFactor;
+
+    // Per-person fixed income
+    const fedBrk = inputs.fedBrackets;
+
+    function computePersonFixed(p, pAge, pAlive, pRetired, optCpp, optOas) {
+      if (!pAlive) return { cpp: 0, oasGross: 0, pension: 0, bridge: 0, other: 0, employment: 0, total: 0 };
+
+      const cpp = pAge >= optCpp.age ? optCpp.annual * infFactor : 0;
+      const oasGross = pAge >= optOas.age ? optOas.annual * infFactor : 0;
+      const pension = pRetired ? p.pensionIncome : 0;
+      const bridge = (pRetired && pAge < 65) ? p.pensionBridge : 0;
+      const other = pRetired ? p.otherIncome * infFactor : 0;
+      const employment = !pRetired ? (p.employmentIncome || 0) * infFactor : 0;
+
+      // If not retired but >= 70, they get CPP+OAS + employment
+      let total;
+      if (!pRetired && pAge >= 70) {
+        total = employment + cpp + oasGross;
+      } else if (!pRetired) {
+        total = employment;
+      } else {
+        total = cpp + oasGross + pension + bridge + other;
+      }
+
+      return { cpp, oasGross, pension, bridge, other, employment, total };
+    }
+
+    const youFixed = computePersonFixed(you, youAge, youAlive, youRetired, youOptCpp, youOptOas);
+    const partnerFixed = computePersonFixed(partner, partnerAge, partnerAlive, partnerRetired, partnerOptCpp, partnerOptOas);
+
+    const combinedFixed = youFixed.total + partnerFixed.total;
+    const portfolioNeed = Math.max(0, desiredNominal - combinedFixed);
+
+    // Available balances with growth
+    const yRrspAvail = yRrsp * (1 + growthRate);
+    const yTfsaAvail = yTfsa * (1 + growthRate);
+    const yNonRegAvail = yNonReg * (1 + growthRate);
+    const ySavAvail = ySav;
+    const pRrspAvail = pRrsp * (1 + growthRate);
+    const pTfsaAvail = pTfsa * (1 + growthRate);
+    const pNonRegAvail = pNonReg * (1 + growthRate);
+    const pSavAvail = pSav;
+
+    const yTotal = yRrspAvail + yTfsaAvail + yNonRegAvail + ySavAvail;
+    const pTotal = pRrspAvail + pTfsaAvail + pNonRegAvail + pSavAvail;
+    const combinedTotal = yTotal + pTotal;
+
+    // Withdrawal allocation
+    let ySavWd = 0, yNrWd = 0, yRrspWd = 0, yTfsaWd = 0;
+    let pSavWd = 0, pNrWd = 0, pRrspWd = 0, pTfsaWd = 0;
+
+    function allocateWithdrawals(need, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, person, alive, retired) {
+      if (!alive || !retired || need <= 0) return { savWd: 0, nrWd: 0, rrspWd: 0, tfsaWd: 0 };
+
+      const cashFloor = strategy === "spend_down" ? 0 : (desiredNominal / 12) * 2 * (need / Math.max(1, portfolioNeed));
+      const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
+      let savWd = Math.min(savAvailAfterFloor, need);
+      let rem = need - savWd;
+
+      const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+      let rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+      rem -= rrspWd;
+
+      let nrWd = Math.min(nonRegAvail, rem);
+      rem -= nrWd;
+
+      let tfsaWd = Math.min(tfsaAvail, rem);
+      rem -= tfsaWd;
+
+      if (rem > 0) {
+        const extraSav = Math.min(savAvail - savWd, rem);
+        savWd += extraSav;
+        rem -= extraSav;
+      }
+
+      // RRSP top-up
+      if (strategy === "optimize" || strategy === "max_estate") {
+        const yearsToEnd = person.lifeExpectancy - (person === you ? youAge : partnerAge);
+        const currentRrspIncome = lockedIncome + rrspWd;
+        const fedBpa = fedBrk.bpa * infFactor;
+        const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
+        const provBpa = provData.bpa * infFactor;
+        const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
+        const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrackets, provBpa, provBrackets);
+        const rrspAfterWd = rrspAvail - rrspWd;
+        const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrk, infFactor);
+
+        let extraRrsp = 0;
+        if (strategy === "max_estate" && yearsToEnd > 0) {
+          const annualTarget = rrspAfterWd / yearsToEnd;
+          extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+          let testIncome = currentRrspIncome;
+          for (const [threshold] of fedBrackets) {
+            const bracketEdge = threshold;
+            if (bracketEdge > testIncome) {
+              const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrackets, provBpa, provBrackets);
+              if (rateAtEdge >= terminalRate) {
+                extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                break;
+              }
+              testIncome = bracketEdge;
+            }
+          }
+          extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        }
+        if (extraRrsp > 0) rrspWd += extraRrsp;
+      }
+
+      return { savWd, nrWd, rrspWd, tfsaWd };
+    }
+
+    if (youRetired || partnerRetired) {
+      // Determine who withdraws
+      const youCanWithdraw = youAlive && youRetired;
+      const partnerCanWithdraw = partnerAlive && partnerRetired;
+
+      if (youCanWithdraw && partnerCanWithdraw) {
+        // Both retired: proportional withdrawal
+        const youShare = combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
+        const partnerShare = combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
+
+        const yOasThresh = you.oasClawbackThreshold * infFactor;
+        const pOasThresh = partner.oasClawbackThreshold * infFactor;
+        const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
+        const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
+
+        const yWd = allocateWithdrawals(youShare, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, you, youAlive, youRetired);
+        const pWd = allocateWithdrawals(partnerShare, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partner, partnerAlive, partnerRetired);
+
+        ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
+        pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
+      } else if (youCanWithdraw) {
+        const yOasThresh = you.oasClawbackThreshold * infFactor;
+        const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
+        const yWd = allocateWithdrawals(portfolioNeed, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, you, youAlive, youRetired);
+        ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
+      } else if (partnerCanWithdraw) {
+        const pOasThresh = partner.oasClawbackThreshold * infFactor;
+        const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
+        const pWd = allocateWithdrawals(portfolioNeed, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partner, partnerAlive, partnerRetired);
+        pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
+      }
+    }
+
+    // Update balances
+    if (youAlive) {
+      if (youRetired) {
+        const yExtraCash = Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0));
+        yRrsp = Math.max(0, yRrspAvail - yRrspWd);
+        yTfsa = Math.max(0, yTfsaAvail - yTfsaWd);
+        yNonReg = Math.max(0, yNonRegAvail - yNrWd);
+        ySav = Math.max(0, ySavAvail - ySavWd + yExtraCash);
+      } else {
+        yRrsp = yRrsp * (1 + inputs.preGrowth) + you.rrspContrib;
+        yTfsa = yTfsa * (1 + inputs.preGrowth) + you.tfsaContrib;
+        yNonReg = yNonReg * (1 + inputs.preGrowth) + you.nonRegContrib;
+        ySav = ySav + you.savingsContrib;
+      }
+    }
+    if (partnerAlive) {
+      if (partnerRetired) {
+        const pExtraCash = Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0));
+        pRrsp = Math.max(0, pRrspAvail - pRrspWd);
+        pTfsa = Math.max(0, pTfsaAvail - pTfsaWd);
+        pNonReg = Math.max(0, pNonRegAvail - pNrWd);
+        pSav = Math.max(0, pSavAvail - pSavWd + pExtraCash);
+      } else {
+        pRrsp = pRrsp * (1 + inputs.preGrowth) + partner.rrspContrib;
+        pTfsa = pTfsa * (1 + inputs.preGrowth) + partner.tfsaContrib;
+        pNonReg = pNonReg * (1 + inputs.preGrowth) + partner.nonRegContrib;
+        pSav = pSav + partner.savingsContrib;
+      }
+    }
+
+    const yPortfolio = yRrsp + yTfsa + yNonReg + ySav;
+    const pPortfolio = pRrsp + pTfsa + pNonReg + pSav;
+    const totalPortfolio = yPortfolio + pPortfolio;
+
+    // Tax per person
+    const fedBpa = fedBrk.bpa * infFactor;
+    const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
+    const provBpa = provData.bpa * infFactor;
+    const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
+
+    function computeTax(rrspWd, cpp, oasGross, pension, bridge, other, nonRegAvail, oasClawbackThreshold) {
+      const taxableIncome = rrspWd + cpp + oasGross + pension + bridge + other + Math.max(0, nonRegAvail * inputs.postGrowth * 0.5);
+      const fedTax = calcProgressiveTax(taxableIncome, fedBpa, fedBrackets);
+      const provTax = calcProgressiveTax(taxableIncome, provBpa, provBrackets);
+      const totalTax = fedTax + provTax;
+      const oasThreshNom = oasClawbackThreshold * infFactor;
+      const oasClawback = Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15));
+      return { taxableIncome, totalTax, oasClawback };
+    }
+
+    const yTax = youRetired ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNonRegAvail, you.oasClawbackThreshold) : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+    const pTax = partnerRetired ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNonRegAvail, partner.oasClawbackThreshold) : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+
+    const totalTax = yTax.totalTax + pTax.totalTax;
+    const totalClawback = yTax.oasClawback + pTax.oasClawback;
+
+    const combinedWd = ySavWd + yNrWd + yRrspWd + yTfsaWd + pSavWd + pNrWd + pRrspWd + pTfsaWd;
+    const netIncome = combinedWd + combinedFixed - totalTax - totalClawback;
+
+    rows.push({
+      year, age: yearAge, youAge, partnerAge, phase,
+      rrsp: yRrsp + pRrsp, tfsa: yTfsa + pTfsa, nonReg: yNonReg + pNonReg, savings: ySav + pSav,
+      totalPortfolio,
+      cpp: youFixed.cpp + partnerFixed.cpp,
+      oasGross: youFixed.oasGross + partnerFixed.oasGross,
+      pension: youFixed.pension + partnerFixed.pension,
+      bridge: youFixed.bridge + partnerFixed.bridge,
+      other: youFixed.other + partnerFixed.other,
+      savWd: ySavWd + pSavWd, nrWd: yNrWd + pNrWd, rrspWd: yRrspWd + pRrspWd, tfsaWd: yTfsaWd + pTfsaWd,
+      taxableIncome: yTax.taxableIncome + pTax.taxableIncome,
+      totalTax, oasClawback: totalClawback, netIncome,
+      desiredNominal,
+      realPortfolio: totalPortfolio / infFactor,
+      contribution: (!youRetired || !partnerRetired) ? (youAlive && !youRetired ? you.rrspContrib + you.tfsaContrib + you.nonRegContrib + you.savingsContrib : 0) + (partnerAlive && !partnerRetired ? partner.rrspContrib + partner.tfsaContrib + partner.nonRegContrib + partner.savingsContrib : 0) : 0,
+      // Per-person data for charts
+      you: {
+        rrsp: yRrsp, tfsa: yTfsa, nonReg: yNonReg, savings: ySav, totalPortfolio: yPortfolio,
+        cpp: youFixed.cpp, oasGross: youFixed.oasGross, pension: youFixed.pension, bridge: youFixed.bridge, other: youFixed.other,
+        savWd: ySavWd, nrWd: yNrWd, rrspWd: yRrspWd, tfsaWd: yTfsaWd,
+        ...yTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - yTax.totalTax - yTax.oasClawback,
+      },
+      partner: {
+        rrsp: pRrsp, tfsa: pTfsa, nonReg: pNonReg, savings: pSav, totalPortfolio: pPortfolio,
+        cpp: partnerFixed.cpp, oasGross: partnerFixed.oasGross, pension: partnerFixed.pension, bridge: partnerFixed.bridge, other: partnerFixed.other,
+        savWd: pSavWd, nrWd: pNrWd, rrspWd: pRrspWd, tfsaWd: pTfsaWd,
+        ...pTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - pTax.totalTax - pTax.oasClawback,
+      },
+    });
+  }
+
+  const lastRow = rows[rows.length - 1];
+  const hasSurplus = lastRow && lastRow.totalPortfolio > 0;
+
+  // Estate value
+  let estateValue = null;
+  if (lastRow) {
+    const finalInfFactor = Math.pow(1 + inputs.inflation, rows.length);
+    const yTermRate = estimateTerminalTaxRate(lastRow.you.rrsp, provData, inputs.fedBrackets, finalInfFactor);
+    const pTermRate = estimateTerminalTaxRate(lastRow.partner.rrsp, provData, inputs.fedBrackets, finalInfFactor);
+    estateValue = {
+      tfsa: lastRow.you.tfsa + lastRow.partner.tfsa,
+      savings: lastRow.you.savings + lastRow.partner.savings,
+      nonReg: (lastRow.you.nonReg + lastRow.partner.nonReg) * (1 - yTermRate * 0.5 * 0.3),
+      rrsp: lastRow.you.rrsp * (1 - yTermRate) + lastRow.partner.rrsp * (1 - pTermRate),
+      total: 0,
+    };
+    estateValue.total = estateValue.tfsa + estateValue.savings + estateValue.nonReg + estateValue.rrsp;
+  }
+
+  // Find portfolio at retirement (when both/first partner retires)
+  const retAge = Math.min(you.retirementAge, partner.retirementAge);
+  const retRow = rows.find(r => r.youAge >= you.retirementAge || r.partnerAge >= partner.retirementAge);
+  const portfolioAtRet = retRow ? retRow.totalPortfolio : 0;
+
+  return {
+    rows, hasSurplus, estateValue, portfolioAtRet,
+    // Per-person CPP/OAS results for the CPP page
+    youResults: youSolo,
+    partnerResults: partnerSolo,
+    optCpp: youOptCpp, optOas: youOptOas,
+    cppOptions: youSolo.cppOptions, oasOptions: youSolo.oasOptions,
+    activeYears: Math.max(0, Math.min(70, you.lifeExpectancy) - retAge),
+    slowdownYears: Math.max(0, Math.min(85, you.lifeExpectancy) - Math.max(70, retAge)),
+    inactiveYears: Math.max(0, you.lifeExpectancy - Math.max(85, retAge)),
+  };
+}
+
+// ═══════════════════════════════════════════════
+// COUPLE SURPLUS FUNCTIONS
+// ═══════════════════════════════════════════════
+function findCoupleFundingRatio(inputs) {
+  let lo = 0.0, hi = 5.0;
+  for (let i = 0; i < 20; i++) {
+    const mid = (lo + hi) / 2;
+    const testInputs = {
+      ...inputs,
+      activeIncome: inputs.activeIncome * mid,
+      slowdownIncome: inputs.slowdownIncome * mid,
+      inactiveIncome: inputs.inactiveIncome * mid,
+    };
+    const result = runCoupleProjection(testInputs);
+    const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
+    if (endBal > 0) lo = mid; else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+function runCoupleBoostSpending(inputs) {
+  let lo = 1.0, hi = 5.0;
+  for (let i = 0; i < 25; i++) {
+    const mid = (lo + hi) / 2;
+    const boostedInputs = {
+      ...inputs,
+      activeIncome: inputs.activeIncome * mid,
+      slowdownIncome: inputs.slowdownIncome * mid,
+      inactiveIncome: inputs.inactiveIncome * mid,
+    };
+    const result = runCoupleProjection(boostedInputs, "spend_down");
+    const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
+    if (endBal > 1000) lo = mid; else hi = mid;
+  }
+  const multiplier = (lo + hi) / 2;
+  const finalInputs = {
+    ...inputs,
+    activeIncome: inputs.activeIncome * multiplier,
+    slowdownIncome: inputs.slowdownIncome * multiplier,
+    inactiveIncome: inputs.inactiveIncome * multiplier,
+  };
+  const finalResult = runCoupleProjection(finalInputs, "spend_down");
+  return {
+    ...finalResult,
+    surplusMode: "boost_spending",
+    hasSurplus: true,
+    spendingMultiplier: multiplier,
+    boostedActiveIncome: inputs.activeIncome * multiplier,
+    boostedSlowdownIncome: inputs.slowdownIncome * multiplier,
+    boostedInactiveIncome: inputs.inactiveIncome * multiplier,
+  };
+}
+
+function runCoupleMaxEstate(inputs) {
+  const result = runCoupleProjection(inputs, "max_estate");
+  return { ...result, surplusMode: "max_estate", hasSurplus: true };
+}
+
+// ═══════════════════════════════════════════════
 // FORMATTING HELPERS
 // ═══════════════════════════════════════════════
 const fmt = (n) => {
@@ -468,28 +874,60 @@ function Explanation({ children }) {
 // PAGES
 // ═══════════════════════════════════════════════
 
-function Page1_Personal({ inputs, setField }) {
+function Page1_Personal({ inputs, setField, personTab, isCouple, activePerson, activeSetField }) {
+  const who = isCouple ? (personTab === "partner" ? "Your Partner's" : "Your") : "Your";
   return (
     <div>
-      <SectionTitle icon="🍁" title="Let's Plan Your Retirement"
-        subtitle="We'll start with some basics about you. These determine the time horizon for your savings to grow and how long your retirement income needs to last." />
+      <SectionTitle icon="🍁" title={isCouple ? `${personTab === "partner" ? "Your Partner's" : "Your"} Details` : "Let's Plan Your Retirement"}
+        subtitle={isCouple ? `Enter ${personTab === "partner" ? "your partner's" : "your"} personal details.` : "We'll start with some basics about you. These determine the time horizon for your savings to grow and how long your retirement income needs to last."} />
+
+      {/* Mode selector — only show on "You" tab */}
+      {(!isCouple || personTab === "you") && (
+        <div className="mb-8">
+          <label className="block text-sm font-medium text-slate-300 mb-2 tracking-wide">Who is this plan for?</label>
+          <div className="grid grid-cols-2 gap-3 max-w-md">
+            {[
+              { key: "single", label: "Just Me", icon: "👤" },
+              { key: "couple", label: "Me & My Partner", icon: "👫" },
+            ].map(opt => (
+              <button key={opt.key}
+                onClick={() => setField("mode", opt.key)}
+                className={`rounded-lg p-4 border text-left transition-all ${
+                  inputs.mode === opt.key
+                    ? "bg-amber-400/15 border-amber-400/50 text-white"
+                    : "bg-slate-800/40 border-slate-700/40 text-slate-400 hover:border-slate-600"
+                }`}>
+                <div className="text-xl mb-1">{opt.icon}</div>
+                <div className="text-sm font-semibold">{opt.label}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
         <div>
-          <Field label="Your Current Age" value={inputs.currentAge} onChange={v => setField("currentAge", v)} type="number" min={18} max={80} hint="How old are you today?" />
-          <Field label="Desired Retirement Age" value={inputs.retirementAge} onChange={v => setField("retirementAge", v)} type="number" min={50} max={75} hint="When do you want to stop working?" />
-          <Field label="Life Expectancy" value={inputs.lifeExpectancy} onChange={v => setField("lifeExpectancy", v)} type="number" min={70} max={105} hint="Plan conservatively — the average Canadian lives to 82" />
+          <Field label={`${who} Current Age`} value={activePerson.currentAge} onChange={v => activeSetField("currentAge", v)} type="number" min={18} max={80} hint="How old are you today?" />
+          <Field label={`${who} Desired Retirement Age`} value={activePerson.retirementAge} onChange={v => activeSetField("retirementAge", v)} type="number" min={50} max={75} hint="When do you want to stop working?" />
+          <Field label={`${who} Life Expectancy`} value={activePerson.lifeExpectancy} onChange={v => activeSetField("lifeExpectancy", v)} type="number" min={70} max={105} hint="Plan conservatively — the average Canadian lives to 82" />
+          <Field label={`${who} Employment Income (Today's $)`} value={activePerson.employmentIncome} onChange={v => activeSetField("employmentIncome", v)} hint="Current annual salary or self-employment income" />
         </div>
         <div>
-          <SelectField label="Province of Residence" value={inputs.province} onChange={v => setField("province", v)} options={Object.keys(PROVINCES)} />
-          <Explanation>
-            Your province determines your tax brackets, which directly affect how much of your retirement income you keep. Tax optimization is one of the most impactful levers in retirement planning.
-          </Explanation>
+          {/* Province is shared — only show on "You" tab */}
+          {personTab !== "partner" && (
+            <>
+              <SelectField label="Province of Residence" value={inputs.province} onChange={v => setField("province", v)} options={Object.keys(PROVINCES)} />
+              <Explanation>
+                Your province determines your tax brackets, which directly affect how much of your retirement income you keep. Tax optimization is one of the most impactful levers in retirement planning.
+              </Explanation>
+            </>
+          )}
           <div className="mt-6 bg-gradient-to-br from-slate-800/60 to-slate-900/60 border border-slate-700/30 rounded-xl p-5">
             <div className="text-xs uppercase tracking-widest text-amber-400/70 mb-3">Planning Horizon</div>
             <div className="flex justify-between items-end">
-              <div><div className="text-3xl font-bold text-white">{inputs.retirementAge - inputs.currentAge}</div><div className="text-xs text-slate-400">years to save</div></div>
+              <div><div className="text-3xl font-bold text-white">{activePerson.retirementAge - activePerson.currentAge}</div><div className="text-xs text-slate-400">years to save</div></div>
               <div className="text-slate-600 text-2xl">→</div>
-              <div><div className="text-3xl font-bold text-amber-400">{inputs.lifeExpectancy - inputs.retirementAge}</div><div className="text-xs text-slate-400">years in retirement</div></div>
+              <div><div className="text-3xl font-bold text-amber-400">{activePerson.lifeExpectancy - activePerson.retirementAge}</div><div className="text-xs text-slate-400">years in retirement</div></div>
             </div>
           </div>
         </div>
@@ -498,20 +936,21 @@ function Page1_Personal({ inputs, setField }) {
   );
 }
 
-function Page2_Balances({ inputs, setField }) {
-  const total = inputs.rrspBal + inputs.tfsaBal + inputs.nonRegBal + inputs.savingsBal;
-  const totalContrib = inputs.rrspContrib + inputs.tfsaContrib + inputs.nonRegContrib + inputs.savingsContrib;
+function Page2_Balances({ inputs, setField, personTab, isCouple, activePerson, activeSetField }) {
+  const total = activePerson.rrspBal + activePerson.tfsaBal + activePerson.nonRegBal + activePerson.savingsBal;
+  const totalContrib = activePerson.rrspContrib + activePerson.tfsaContrib + activePerson.nonRegContrib + activePerson.savingsContrib;
+  const who = isCouple ? (personTab === "partner" ? "Your Partner's" : "Your") : "Your";
   return (
     <div>
-      <SectionTitle icon="💰" title="Your Savings Today"
-        subtitle="Enter your current account balances and how much you contribute each year. Each account type has different tax treatment, which we'll optimize for you." />
+      <SectionTitle icon="💰" title={`${who} Savings Today`}
+        subtitle={`Enter ${isCouple && personTab === "partner" ? "your partner's" : "your"} current account balances and how much ${isCouple && personTab === "partner" ? "they contribute" : "you contribute"} each year.`} />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
         <div>
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">Current Balances</h3>
-          <Field label="RRSP" value={inputs.rrspBal} onChange={v => setField("rrspBal", v)} hint="Tax-deferred growth, taxable on withdrawal" />
-          <Field label="TFSA" value={inputs.tfsaBal} onChange={v => setField("tfsaBal", v)} hint="Tax-free growth and withdrawal" />
-          <Field label="Non-Registered Investment" value={inputs.nonRegBal} onChange={v => setField("nonRegBal", v)} hint="Investment growth taxed as capital gains (50% inclusion)" />
-          <Field label="Savings Account (Cash)" value={inputs.savingsBal} onChange={v => setField("savingsBal", v)} hint="No investment growth — just cash" />
+          <Field label="RRSP" value={activePerson.rrspBal} onChange={v => activeSetField("rrspBal", v)} hint="Tax-deferred growth, taxable on withdrawal" />
+          <Field label="TFSA" value={activePerson.tfsaBal} onChange={v => activeSetField("tfsaBal", v)} hint="Tax-free growth and withdrawal" />
+          <Field label="Non-Registered Investment" value={activePerson.nonRegBal} onChange={v => activeSetField("nonRegBal", v)} hint="Investment growth taxed as capital gains (50% inclusion)" />
+          <Field label="Savings Account (Cash)" value={activePerson.savingsBal} onChange={v => activeSetField("savingsBal", v)} hint="No investment growth — just cash" />
           <div className="border-t border-slate-700/50 pt-3 mt-2 flex justify-between">
             <span className="text-sm text-slate-400">Total Savings</span>
             <span className="text-lg font-bold text-white">{fmt(total)}</span>
@@ -519,10 +958,10 @@ function Page2_Balances({ inputs, setField }) {
         </div>
         <div>
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">Annual Contributions</h3>
-          <Field label="RRSP" value={inputs.rrspContrib} onChange={v => setField("rrspContrib", v)} />
-          <Field label="TFSA" value={inputs.tfsaContrib} onChange={v => setField("tfsaContrib", v)} />
-          <Field label="Non-Registered" value={inputs.nonRegContrib} onChange={v => setField("nonRegContrib", v)} />
-          <Field label="Savings Account" value={inputs.savingsContrib} onChange={v => setField("savingsContrib", v)} />
+          <Field label="RRSP" value={activePerson.rrspContrib} onChange={v => activeSetField("rrspContrib", v)} />
+          <Field label="TFSA" value={activePerson.tfsaContrib} onChange={v => activeSetField("tfsaContrib", v)} />
+          <Field label="Non-Registered" value={activePerson.nonRegContrib} onChange={v => activeSetField("nonRegContrib", v)} />
+          <Field label="Savings Account" value={activePerson.savingsContrib} onChange={v => activeSetField("savingsContrib", v)} />
           <div className="border-t border-slate-700/50 pt-3 mt-2 flex justify-between">
             <span className="text-sm text-slate-400">Total Contributions</span>
             <span className="text-lg font-bold text-white">{fmt(totalContrib)}/yr</span>
@@ -536,14 +975,14 @@ function Page2_Balances({ inputs, setField }) {
   );
 }
 
-function Page3_Income({ inputs, setField }) {
+function Page3_Income({ inputs, setField, isCouple }) {
   return (
     <div>
-      <SectionTitle icon="🏖️" title="Your Retirement Lifestyle"
-        subtitle="How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age." />
+      <SectionTitle icon="🏖️" title={isCouple ? "Your Combined Retirement Lifestyle" : "Your Retirement Lifestyle"}
+        subtitle={isCouple ? "How much combined annual income do you and your partner need in retirement? These are your total household spending targets." : "How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age."} />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         {[
-          { key: "activeIncome", label: "Active Phase", ages: `${inputs.retirementAge}–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
+          { key: "activeIncome", label: "Active Phase", ages: `Retirement–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
           { key: "slowdownIncome", label: "Slowdown Phase", ages: "70–85", icon: "🏡", desc: "Quieter lifestyle, less travel" },
           { key: "inactiveIncome", label: "Inactive Phase", ages: "85+", icon: "🪑", desc: "Mostly home-based, possible care costs" },
         ].map(p => (
@@ -551,12 +990,12 @@ function Page3_Income({ inputs, setField }) {
             <div className="text-2xl mb-2">{p.icon}</div>
             <div className="text-sm font-semibold text-white mb-1">{p.label} <span className="text-slate-500 font-normal">({p.ages})</span></div>
             <div className="text-xs text-slate-400 mb-3">{p.desc}</div>
-            <Field label="Annual Income (Today's $)" value={inputs[p.key]} onChange={v => setField(p.key, v)} />
+            <Field label={isCouple ? "Combined Annual Income (Today's $)" : "Annual Income (Today's $)"} value={inputs[p.key]} onChange={v => setField(p.key, v)} />
           </div>
         ))}
       </div>
       <Explanation>
-        These amounts are in today's dollars — the model automatically adjusts for inflation each year. A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase.
+        These amounts are in today's dollars — the model automatically adjusts for inflation each year. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
       </Explanation>
     </div>
   );
@@ -601,62 +1040,71 @@ function Page4_Rates({ inputs, setField }) {
   );
 }
 
-function Page5_CPP({ inputs, setField, results }) {
-  const showBridge = inputs.retirementAge < 65;
+function Page5_CPP({ inputs, setField, personTab, isCouple, activePerson, activeSetField, results }) {
+  const showBridge = activePerson.retirementAge < 65;
+  const who = isCouple ? (personTab === "partner" ? "Your Partner's" : "Your") : "";
+  // For couple mode, use per-person CPP/OAS results
+  const personResults = isCouple ? (personTab === "partner" ? results.partnerResults : results.youResults) : results;
   return (
     <div>
-      <SectionTitle icon="🏛️" title="CPP, OAS & Pension"
-        subtitle="Government benefits and employer pensions form the foundation of your retirement income. We'll find the optimal age to start collecting CPP and OAS based on your life expectancy." />
+      <SectionTitle icon="🏛️" title={`${who ? who + " " : ""}CPP, OAS & Pension`}
+        subtitle={`Government benefits and employer pensions form the foundation of ${isCouple && personTab === "partner" ? "your partner's" : "your"} retirement income.`} />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 mb-6">
         <div>
-          <Field label="CPP Annual Amount at Age 65 (Today's $)" value={inputs.cppAt65} onChange={v => setField("cppAt65", v)} hint="2025 max: $17,196. Check your My Service Canada Account for your estimate." />
-          <Field label="OAS Annual Amount at Age 65 (Today's $)" value={inputs.oasAt65} onChange={v => setField("oasAt65", v)} hint="2026 max: ~$8,908 (age 65–74)" />
-          <Field label="OAS Clawback Threshold (Today's $)" value={inputs.oasClawbackThreshold} onChange={v => setField("oasClawbackThreshold", v)} hint="2026: $95,323. Above this, 15¢ per dollar is clawed back." />
+          <Field label="CPP Annual Amount at Age 65 (Today's $)" value={activePerson.cppAt65} onChange={v => activeSetField("cppAt65", v)} hint="2025 max: $17,196. Check your My Service Canada Account for your estimate." />
+          <Field label="OAS Annual Amount at Age 65 (Today's $)" value={activePerson.oasAt65} onChange={v => activeSetField("oasAt65", v)} hint="2026 max: ~$8,908 (age 65–74)" />
+          <Field label="OAS Clawback Threshold (Today's $)" value={activePerson.oasClawbackThreshold} onChange={v => activeSetField("oasClawbackThreshold", v)} hint="2026: $95,323. Above this, 15¢ per dollar is clawed back." />
         </div>
         <div>
-          <div className="bg-gradient-to-br from-amber-900/20 to-slate-800/60 border border-amber-400/20 rounded-xl p-5">
-            <div className="text-xs uppercase tracking-widest text-amber-400/70 mb-4">Optimal Start Ages</div>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="text-center">
-                <div className="text-4xl font-bold text-amber-400">{results.optCpp.age}</div>
-                <div className="text-xs text-slate-400 mt-1">CPP Start Age</div>
-                <div className="text-sm text-white mt-1">{fmt(results.optCpp.annual)}/yr</div>
-              </div>
-              <div className="text-center">
-                <div className="text-4xl font-bold text-amber-400">{results.optOas.age}</div>
-                <div className="text-xs text-slate-400 mt-1">OAS Start Age</div>
-                <div className="text-sm text-white mt-1">{fmt(results.optOas.annual)}/yr</div>
+          {personResults && (
+            <div className="bg-gradient-to-br from-amber-900/20 to-slate-800/60 border border-amber-400/20 rounded-xl p-5">
+              <div className="text-xs uppercase tracking-widest text-amber-400/70 mb-4">Optimal Start Ages</div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="text-center">
+                  <div className="text-4xl font-bold text-amber-400">{personResults.optCpp.age}</div>
+                  <div className="text-xs text-slate-400 mt-1">CPP Start Age</div>
+                  <div className="text-sm text-white mt-1">{fmt(personResults.optCpp.annual)}/yr</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-4xl font-bold text-amber-400">{personResults.optOas.age}</div>
+                  <div className="text-xs text-slate-400 mt-1">OAS Start Age</div>
+                  <div className="text-sm text-white mt-1">{fmt(personResults.optOas.annual)}/yr</div>
+                </div>
               </div>
             </div>
-          </div>
+          )}
           <Explanation>
-            CPP decreases by 0.6%/month before 65 (max –36% at 60) and increases by 0.7%/month after 65 (max +42% at 70). OAS increases by 0.6%/month after 65 (max +36% at 70). With your life expectancy of {inputs.lifeExpectancy}, delaying to {results.optCpp.age} maximizes your total lifetime CPP benefits.
+            CPP decreases by 0.6%/month before 65 (max -36% at 60) and increases by 0.7%/month after 65 (max +42% at 70). OAS increases by 0.6%/month after 65 (max +36% at 70). With a life expectancy of {activePerson.lifeExpectancy}, delaying to {personResults?.optCpp?.age || 65} maximizes total lifetime CPP benefits.
           </Explanation>
         </div>
       </div>
-      <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-widest mb-3">CPP Amount by Start Age</h3>
-      <div className="grid grid-cols-11 gap-1 text-center text-xs">
-        {results.cppOptions.map(o => (
-          <div key={o.age} className={`rounded-lg p-2 ${o.age === results.optCpp.age ? "bg-amber-400/20 border border-amber-400/40" : "bg-slate-800/40"}`}>
-            <div className="text-slate-400">Age {o.age}</div>
-            <div className={`font-bold ${o.age === results.optCpp.age ? "text-amber-400" : "text-white"}`}>{fmt(o.annual)}</div>
-            <div className="text-slate-500">{fmtK(o.lifetime)}</div>
+      {personResults && (
+        <>
+          <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-widest mb-3">CPP Amount by Start Age</h3>
+          <div className="grid grid-cols-11 gap-1 text-center text-xs">
+            {personResults.cppOptions.map(o => (
+              <div key={o.age} className={`rounded-lg p-2 ${o.age === personResults.optCpp.age ? "bg-amber-400/20 border border-amber-400/40" : "bg-slate-800/40"}`}>
+                <div className="text-slate-400">Age {o.age}</div>
+                <div className={`font-bold ${o.age === personResults.optCpp.age ? "text-amber-400" : "text-white"}`}>{fmt(o.annual)}</div>
+                <div className="text-slate-500">{fmtK(o.lifetime)}</div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </>
+      )}
 
       {/* Pension & Other Income */}
       <div className="mt-8">
-        <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">Pension & Other Retirement Income</h3>
+        <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">{who ? who + " " : ""}Pension & Other Retirement Income</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
           <div>
-            <Field label="Annual Pension Income (Today's $)" value={inputs.pensionIncome} onChange={v => setField("pensionIncome", v)} hint="Employer defined-benefit pension. Taxed as regular income. Not adjusted for inflation." />
+            <Field label="Annual Pension Income (Today's $)" value={activePerson.pensionIncome} onChange={v => activeSetField("pensionIncome", v)} hint="Employer defined-benefit pension. Taxed as regular income. Not adjusted for inflation." />
             {showBridge && (
-              <Field label="Pension Bridge Benefit (Today's $)" value={inputs.pensionBridge} onChange={v => setField("pensionBridge", v)} hint={`Extra annual amount paid from retirement until age 65 to cover the gap before CPP/OAS. Taxed as regular income. Not adjusted for inflation.`} />
+              <Field label="Pension Bridge Benefit (Today's $)" value={activePerson.pensionBridge} onChange={v => activeSetField("pensionBridge", v)} hint={`Extra annual amount paid from retirement until age 65 to cover the gap before CPP/OAS. Taxed as regular income. Not adjusted for inflation.`} />
             )}
           </div>
           <div>
-            <Field label="Other Annual Retirement Income (Today's $)" value={inputs.otherIncome} onChange={v => setField("otherIncome", v)} hint="Rental income, part-time work, annuities, etc. Taxed as regular income. Adjusted for inflation." />
+            <Field label="Other Annual Retirement Income (Today's $)" value={activePerson.otherIncome} onChange={v => activeSetField("otherIncome", v)} hint="Rental income, part-time work, annuities, etc. Taxed as regular income. Adjusted for inflation." />
             <Explanation>
               Pension and other income are taxed the same as RRSP withdrawals (fully taxable as regular income). They also count toward the OAS clawback threshold.
               {showBridge && " The bridge benefit is only paid until age 65, when CPP and OAS typically begin."}
@@ -668,7 +1116,7 @@ function Page5_CPP({ inputs, setField, results }) {
   );
 }
 
-function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
+function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple }) {
   const status = results.fundingRatio >= 1 ? { icon: "✅", text: "Plan is On Track", color: "text-emerald-400" }
     : results.fundingRatio >= 0.7 ? { icon: "⚠️", text: "Needs Improvement", color: "text-amber-400" }
     : { icon: "❌", text: "Plan is Unrealistic", color: "text-red-400" };
@@ -734,7 +1182,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
               sub={`was ${fmt(inputs.inactiveIncome)} (+${Math.round((results.spendingMultiplier - 1) * 100)}%)`} accent />
           </div>
           <Explanation>
-            By increasing your spending by {Math.round((results.spendingMultiplier - 1) * 100)}% across all phases, your portfolio is projected to be fully utilized by age {inputs.lifeExpectancy}. These amounts are in today's dollars and will be inflation-adjusted each year.
+            By increasing your spending by {Math.round((results.spendingMultiplier - 1) * 100)}% across all phases, your {isCouple ? "combined portfolios are" : "portfolio is"} projected to be fully utilized by the end of the plan. These amounts are in today's dollars and will be inflation-adjusted each year.
           </Explanation>
         </div>
       )}
@@ -767,6 +1215,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Tax-Optimized Withdrawal Strategy</h3>
           <div className="space-y-2 text-sm text-slate-300">
+            {isCouple && <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">0.</span><span><strong className="text-white">Proportional split</strong> — when both partners are retired, withdrawals are split proportional to each partner's remaining portfolio</span></div>}
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">1.</span><span><strong className="text-white">Cash savings first</strong> — no growth benefit, so spend it early</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">RRSP to fill low brackets</strong> — drawn up to OAS clawback threshold, plus extra if your current tax rate is lower than the projected rate at death</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">3.</span><span><strong className="text-white">Non-registered next</strong> — only 50% of capital gains are taxable</span></div>
@@ -775,16 +1224,30 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
         </div>
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Guaranteed Income</h3>
-          <div className="space-y-2 text-sm text-slate-300">
-            <div className="flex justify-between"><span>CPP starts at age</span><span className="text-white font-semibold">{results.optCpp.age}</span></div>
-            <div className="flex justify-between"><span>CPP annual (today's $)</span><span className="text-white font-semibold">{fmt(results.optCpp.annual)}</span></div>
-            <div className="flex justify-between"><span>OAS starts at age</span><span className="text-white font-semibold">{results.optOas.age}</span></div>
-            <div className="flex justify-between"><span>OAS annual (today's $)</span><span className="text-white font-semibold">{fmt(results.optOas.annual)}</span></div>
-            {inputs.pensionIncome > 0 && <div className="flex justify-between"><span>Pension (today's $)</span><span className="text-white font-semibold">{fmt(inputs.pensionIncome)}/yr</span></div>}
-            {inputs.pensionBridge > 0 && inputs.retirementAge < 65 && <div className="flex justify-between"><span>Bridge until 65 (today's $)</span><span className="text-white font-semibold">{fmt(inputs.pensionBridge)}/yr</span></div>}
-            {inputs.otherIncome > 0 && <div className="flex justify-between"><span>Other income (today's $)</span><span className="text-white font-semibold">{fmt(inputs.otherIncome)}/yr</span></div>}
-            <div className="flex justify-between border-t border-slate-700/40 pt-2"><span>Combined at 65+ (today's $)</span><span className="text-amber-400 font-semibold">{fmt(results.optCpp.annual + results.optOas.annual + inputs.pensionIncome + inputs.otherIncome)}/yr</span></div>
-          </div>
+          {isCouple ? (
+            <div className="space-y-2 text-sm text-slate-300">
+              <div className="text-xs text-slate-500 uppercase tracking-wider font-semibold">You</div>
+              <div className="flex justify-between"><span>CPP at age {results.youResults.optCpp.age}</span><span className="text-white font-semibold">{fmt(results.youResults.optCpp.annual)}/yr</span></div>
+              <div className="flex justify-between"><span>OAS at age {results.youResults.optOas.age}</span><span className="text-white font-semibold">{fmt(results.youResults.optOas.annual)}/yr</span></div>
+              {inputs.pensionIncome > 0 && <div className="flex justify-between"><span>Pension</span><span className="text-white font-semibold">{fmt(inputs.pensionIncome)}/yr</span></div>}
+              <div className="text-xs text-slate-500 uppercase tracking-wider font-semibold mt-3 pt-2 border-t border-slate-700/40">Your Partner</div>
+              <div className="flex justify-between"><span>CPP at age {results.partnerResults.optCpp.age}</span><span className="text-white font-semibold">{fmt(results.partnerResults.optCpp.annual)}/yr</span></div>
+              <div className="flex justify-between"><span>OAS at age {results.partnerResults.optOas.age}</span><span className="text-white font-semibold">{fmt(results.partnerResults.optOas.annual)}/yr</span></div>
+              {inputs.partner.pensionIncome > 0 && <div className="flex justify-between"><span>Pension</span><span className="text-white font-semibold">{fmt(inputs.partner.pensionIncome)}/yr</span></div>}
+              <div className="flex justify-between border-t border-slate-700/40 pt-2"><span>Combined at 65+</span><span className="text-amber-400 font-semibold">{fmt(results.youResults.optCpp.annual + results.youResults.optOas.annual + inputs.pensionIncome + results.partnerResults.optCpp.annual + results.partnerResults.optOas.annual + inputs.partner.pensionIncome)}/yr</span></div>
+            </div>
+          ) : (
+            <div className="space-y-2 text-sm text-slate-300">
+              <div className="flex justify-between"><span>CPP starts at age</span><span className="text-white font-semibold">{results.optCpp.age}</span></div>
+              <div className="flex justify-between"><span>CPP annual (today's $)</span><span className="text-white font-semibold">{fmt(results.optCpp.annual)}</span></div>
+              <div className="flex justify-between"><span>OAS starts at age</span><span className="text-white font-semibold">{results.optOas.age}</span></div>
+              <div className="flex justify-between"><span>OAS annual (today's $)</span><span className="text-white font-semibold">{fmt(results.optOas.annual)}</span></div>
+              {inputs.pensionIncome > 0 && <div className="flex justify-between"><span>Pension (today's $)</span><span className="text-white font-semibold">{fmt(inputs.pensionIncome)}/yr</span></div>}
+              {inputs.pensionBridge > 0 && inputs.retirementAge < 65 && <div className="flex justify-between"><span>Bridge until 65 (today's $)</span><span className="text-white font-semibold">{fmt(inputs.pensionBridge)}/yr</span></div>}
+              {inputs.otherIncome > 0 && <div className="flex justify-between"><span>Other income (today's $)</span><span className="text-white font-semibold">{fmt(inputs.otherIncome)}/yr</span></div>}
+              <div className="flex justify-between border-t border-slate-700/40 pt-2"><span>Combined at 65+ (today's $)</span><span className="text-amber-400 font-semibold">{fmt(results.optCpp.annual + results.optOas.annual + inputs.pensionIncome + inputs.otherIncome)}/yr</span></div>
+            </div>
+          )}
         </div>
       </div>
       <Explanation>
@@ -794,15 +1257,20 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode }) {
   );
 }
 
-function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
-  const retAge = inputs.retirementAge;
-  const chartData = results.rows.map(r => ({
-    age: r.age, portfolio: r.totalPortfolio, real: r.realPortfolio,
-    rrsp: r.rrsp, tfsa: r.tfsa, nonReg: r.nonReg, savings: r.savings,
-    cpp: r.cpp, oas: r.oasGross, pension: r.pension, bridge: r.bridge, other: r.other,
-    savWd: r.savWd, nrWd: r.nrWd, rrspWd: r.rrspWd, tfsaWd: r.tfsaWd,
-    tax: r.totalTax, clawback: r.oasClawback, net: r.netIncome, desired: r.desiredNominal,
-  }));
+function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView }) {
+  const retAge = isCouple ? Math.min(inputs.retirementAge, inputs.partner.retirementAge) : inputs.retirementAge;
+
+  const chartData = results.rows.map(r => {
+    // Select data source based on chart view
+    const src = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
+    return {
+      age: r.age, portfolio: src.totalPortfolio ?? r.totalPortfolio, real: r.realPortfolio,
+      rrsp: src.rrsp, tfsa: src.tfsa, nonReg: src.nonReg, savings: src.savings,
+      cpp: src.cpp, oas: src.oasGross, pension: src.pension, bridge: src.bridge, other: src.other,
+      savWd: src.savWd, nrWd: src.nrWd, rrspWd: src.rrspWd, tfsaWd: src.tfsaWd,
+      tax: src.totalTax ?? r.totalTax, clawback: src.oasClawback ?? r.oasClawback, net: src.netIncome ?? r.netIncome, desired: r.desiredNominal,
+    };
+  });
   const retData = chartData.filter(d => d.age >= retAge);
   const ttStyle = { backgroundColor: "#1e293b", border: "1px solid #334155", borderRadius: "8px", fontSize: 12 };
   const CustomTooltip = ({ active, payload, label }) => {
@@ -848,6 +1316,28 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
               ))}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Couple chart view toggle */}
+      {isCouple && (
+        <div className="flex items-center justify-end gap-2 mb-4">
+          <span className="text-sm text-slate-400">View:</span>
+          {[
+            { key: "combined", label: "Combined" },
+            { key: "you", label: "You" },
+            { key: "partner", label: "Partner" },
+          ].map(opt => (
+            <button key={opt.key}
+              onClick={() => setChartView(opt.key)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-all ${
+                chartView === opt.key
+                  ? "bg-amber-400/15 text-amber-400 border border-amber-400/40"
+                  : "bg-slate-800/60 text-slate-400 border border-slate-700/40 hover:text-white"
+              }`}>
+              {opt.label}
+            </button>
+          ))}
         </div>
       )}
 
@@ -977,8 +1467,18 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode }) {
 // ═══════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════
+const PARTNER_DEFAULTS = {
+  currentAge: 35, retirementAge: 65, lifeExpectancy: 90, employmentIncome: 0,
+  rrspBal: 50000, tfsaBal: 40000, nonRegBal: 20000, savingsBal: 15000,
+  rrspContrib: 10000, tfsaContrib: 7000, nonRegContrib: 5000, savingsContrib: 3000,
+  pensionIncome: 0, pensionBridge: 0, otherIncome: 0,
+  cppAt65: 17196, oasAt65: 8908, oasClawbackThreshold: 95323,
+};
+
 const DEFAULTS = {
+  mode: "single",
   currentAge: 35, retirementAge: 65, lifeExpectancy: 90, province: "Ontario",
+  employmentIncome: 0,
   rrspBal: 50000, tfsaBal: 40000, nonRegBal: 20000, savingsBal: 15000,
   rrspContrib: 10000, tfsaContrib: 7000, nonRegContrib: 5000, savingsContrib: 3000,
   activeIncome: 70000, slowdownIncome: 55000, inactiveIncome: 40000,
@@ -986,14 +1486,15 @@ const DEFAULTS = {
   preGrowth: 0.06, postGrowth: 0.04, inflation: 0.02,
   cppAt65: 17196, oasAt65: 8908, oasClawbackThreshold: 95323,
   fedBrackets: FED_BRACKETS_DEFAULT,
+  partner: { ...PARTNER_DEFAULTS },
 };
 
 const PAGES = [
-  { title: "Personal", icon: "🍁" },
-  { title: "Savings", icon: "💰" },
-  { title: "Income", icon: "🏖️" },
+  { title: "Personal", icon: "🍁", perPerson: true },
+  { title: "Savings", icon: "💰", perPerson: true },
+  { title: "CPP & OAS", icon: "🏛️", perPerson: true },
   { title: "Rates", icon: "📊" },
-  { title: "CPP & OAS", icon: "🏛️" },
+  { title: "Income", icon: "🏖️" },
   { title: "Results", icon: "📋" },
   { title: "Charts", icon: "📈" },
 ];
@@ -1008,7 +1509,12 @@ function loadSavedInputs() {
     if (saved) {
       const parsed = JSON.parse(saved);
       // Merge with defaults so new fields are always present
-      return { ...DEFAULTS, ...parsed, fedBrackets: DEFAULTS.fedBrackets };
+      return {
+        ...DEFAULTS,
+        ...parsed,
+        fedBrackets: DEFAULTS.fedBrackets,
+        partner: { ...PARTNER_DEFAULTS, ...(parsed.partner || {}) },
+      };
     }
   } catch (e) { /* ignore corrupt data */ }
   return DEFAULTS;
@@ -1032,6 +1538,8 @@ export default function App() {
   });
   const [inputs, setInputs] = useState(loadSavedInputs);
   const [surplusMode, setSurplusMode] = useState(loadSurplusMode);
+  const [personTab, setPersonTab] = useState("you");
+  const [chartView, setChartView] = useState("combined");
 
   // Persist inputs to localStorage
   useEffect(() => {
@@ -1059,29 +1567,86 @@ export default function App() {
     setInputs(prev => ({ ...prev, [key]: value }));
   }, []);
 
+  const setPartnerField = useCallback((key, value) => {
+    setInputs(prev => ({ ...prev, partner: { ...prev.partner, [key]: value } }));
+  }, []);
+
+  const isCouple = inputs.mode === "couple";
+  const currentPageDef = PAGES[page];
+
   const results = useMemo(() => {
+    if (isCouple) {
+      const fundingRatio = findCoupleFundingRatio(inputs);
+      const base = runCoupleProjection(inputs);
+      if (!base.hasSurplus) {
+        return { ...base, surplusMode: null, fundingRatio };
+      }
+      if (surplusMode === "boost_spending") {
+        return { ...runCoupleBoostSpending(inputs), fundingRatio };
+      }
+      return { ...runCoupleMaxEstate(inputs), fundingRatio };
+    }
     const fundingRatio = findFundingRatio(inputs);
     const base = runProjection(inputs);
-
     if (!base.hasSurplus) {
       return { ...base, surplusMode: null, fundingRatio };
     }
     if (surplusMode === "boost_spending") {
       return { ...runBoostSpending(inputs), fundingRatio };
     }
-    // Default: maximize estate
     return { ...runMaxEstate(inputs), fundingRatio };
-  }, [inputs, surplusMode]);
+  }, [inputs, surplusMode, isCouple]);
+
+  const scrollTop = () => setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 0);
+
+  // Couple-aware navigation
+  const handleNext = useCallback(() => {
+    if (isCouple && currentPageDef?.perPerson && personTab === "you") {
+      setPersonTab("partner");
+    } else {
+      setPage(p => Math.min(PAGES.length - 1, p + 1));
+      if (isCouple) setPersonTab("you");
+    }
+    scrollTop();
+  }, [isCouple, currentPageDef, personTab]);
+
+  const handleBack = useCallback(() => {
+    if (isCouple && currentPageDef?.perPerson && personTab === "partner") {
+      setPersonTab("you");
+    } else {
+      setPage(p => {
+        const prev = Math.max(0, p - 1);
+        if (isCouple && PAGES[prev]?.perPerson) setPersonTab("partner");
+        return prev;
+      });
+    }
+    scrollTop();
+  }, [isCouple, currentPageDef, personTab]);
+
+  // Per-person helpers for current tab
+  const activePerson = personTab === "partner" ? inputs.partner : inputs;
+  const activeSetField = personTab === "partner" ? setPartnerField : setField;
 
   const pages = [
-    <Page1_Personal inputs={inputs} setField={setField} />,
-    <Page2_Balances inputs={inputs} setField={setField} />,
-    <Page3_Income inputs={inputs} setField={setField} />,
+    <Page1_Personal inputs={inputs} setField={setField} setPartnerField={setPartnerField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} />,
+    <Page2_Balances inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} />,
+    <Page5_CPP inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} results={results} />,
     <Page4_Rates inputs={inputs} setField={setField} />,
-    <Page5_CPP inputs={inputs} setField={setField} results={results} />,
-    <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} />,
-    <Page7_Charts inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} />,
+    <Page3_Income inputs={inputs} setField={setField} isCouple={isCouple} />,
+    <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} />,
+    <Page7_Charts inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} />,
   ];
+
+  // Next button label
+  const isLastPage = page === PAGES.length - 1;
+  const isSecondLastPage = page === PAGES.length - 2;
+  let nextLabel = isSecondLastPage ? "See Results →" : "Next →";
+  if (isCouple && currentPageDef?.perPerson && personTab === "you") {
+    nextLabel = "Next: Your Partner →";
+  }
+
+  // Back button disabled state
+  const backDisabled = page === 0 && (!isCouple || personTab === "you");
 
   return (
     <div className="min-h-screen bg-slate-900 text-white" style={{ fontFamily: "'DM Sans', sans-serif" }}>
@@ -1092,7 +1657,7 @@ export default function App() {
         <div className="max-w-5xl mx-auto px-4 py-3">
           <div className="flex items-center gap-1">
             {PAGES.map((p, i) => (
-              <button key={i} onClick={() => setPage(i)}
+              <button key={i} onClick={() => { setPage(i); setPersonTab("you"); scrollTop(); }}
                 className={`flex-1 flex items-center justify-center gap-1 py-2 rounded-lg text-xs font-medium transition-all ${i === page ? "bg-amber-400/15 text-amber-400 border border-amber-400/30" : i < page ? "text-slate-400 hover:text-white" : "text-slate-600"}`}>
                 <span className="hidden sm:inline">{p.icon}</span>
                 <span className="hidden md:inline">{p.title}</span>
@@ -1106,19 +1671,41 @@ export default function App() {
         </div>
       </div>
 
+      {/* Floating You/Partner toggle */}
+      {isCouple && currentPageDef?.perPerson && (
+        <div className="sticky top-[52px] z-40 bg-slate-900/95 backdrop-blur border-b border-slate-800/60">
+          <div className="max-w-5xl mx-auto px-4 py-2 flex items-center justify-center gap-2">
+            {[
+              { key: "you", label: "You" },
+              { key: "partner", label: "Your Partner" },
+            ].map(opt => (
+              <button key={opt.key}
+                onClick={() => setPersonTab(opt.key)}
+                className={`px-5 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                  personTab === opt.key
+                    ? "bg-amber-400/15 text-amber-400 border border-amber-400/40"
+                    : "bg-slate-800/60 text-slate-400 border border-slate-700/40 hover:text-white hover:border-slate-600"
+                }`}>
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Page content */}
       <div className="max-w-5xl mx-auto px-4 py-8">
-        <div key={page} className="animate-fadeIn">{pages[page]}</div>
+        <div key={`${page}-${personTab}`} className="animate-fadeIn">{pages[page]}</div>
 
         {/* Navigation */}
         <div className="flex justify-between mt-10 pt-6 border-t border-slate-800/60">
-          <button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0}
-            className={`px-6 py-2.5 rounded-lg font-medium text-sm transition-all ${page === 0 ? "text-slate-600 cursor-not-allowed" : "text-slate-300 hover:text-white hover:bg-slate-800"}`}>
+          <button onClick={handleBack} disabled={backDisabled}
+            className={`px-6 py-2.5 rounded-lg font-medium text-sm transition-all ${backDisabled ? "text-slate-600 cursor-not-allowed" : "text-slate-300 hover:text-white hover:bg-slate-800"}`}>
             ← Back
           </button>
-          <button onClick={() => setPage(Math.min(PAGES.length - 1, page + 1))} disabled={page === PAGES.length - 1}
-            className={`px-6 py-2.5 rounded-lg font-medium text-sm transition-all ${page === PAGES.length - 1 ? "text-slate-600 cursor-not-allowed" : "bg-amber-400 text-slate-900 hover:bg-amber-300"}`}>
-            {page === PAGES.length - 2 ? "See Results →" : "Next →"}
+          <button onClick={handleNext} disabled={isLastPage}
+            className={`px-6 py-2.5 rounded-lg font-medium text-sm transition-all ${isLastPage ? "text-slate-600 cursor-not-allowed" : "bg-amber-400 text-slate-900 hover:bg-amber-300"}`}>
+            {nextLabel}
           </button>
         </div>
       </div>
