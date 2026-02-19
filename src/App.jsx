@@ -1215,11 +1215,11 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Tax-Optimized Withdrawal Strategy</h3>
           <div className="space-y-2 text-sm text-slate-300">
-            {isCouple && <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">0.</span><span><strong className="text-white">Proportional split</strong> — when both partners are retired, withdrawals are split proportional to each partner's remaining portfolio</span></div>}
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">1.</span><span><strong className="text-white">Cash savings first</strong> — no growth benefit, so spend it early</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">2.</span><span><strong className="text-white">RRSP to fill low brackets</strong> — drawn up to OAS clawback threshold, plus extra if your current tax rate is lower than the projected rate at death</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">3.</span><span><strong className="text-white">Non-registered next</strong> — only 50% of capital gains are taxable</span></div>
             <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">4.</span><span><strong className="text-white">TFSA last</strong> — completely tax-free, let it compound as long as possible</span></div>
+            {isCouple && <div className="flex items-start gap-2"><span className="text-amber-400 mt-0.5">•</span><span><strong className="text-white">Proportional split</strong> — when both partners are retired, withdrawals are split proportional to each partner's remaining portfolio</span></div>}
           </div>
         </div>
         <div className="bg-slate-800/40 border border-slate-700/30 rounded-xl p-5">
@@ -1260,11 +1260,13 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
 function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView }) {
   const retAge = isCouple ? Math.min(inputs.retirementAge, inputs.partner.retirementAge) : inputs.retirementAge;
 
-  const chartData = results.rows.map(r => {
+  const chartData = results.rows.map((r, idx) => {
     // Select data source based on chart view
     const src = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
+    const portfolio = src.totalPortfolio ?? r.totalPortfolio;
+    const infFactor = Math.pow(1 + (inputs.inflation || 0.02), idx + 1);
     return {
-      age: r.age, portfolio: src.totalPortfolio ?? r.totalPortfolio, real: r.realPortfolio,
+      age: r.age, portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
       rrsp: src.rrsp, tfsa: src.tfsa, nonReg: src.nonReg, savings: src.savings,
       cpp: src.cpp, oas: src.oasGross, pension: src.pension, bridge: src.bridge, other: src.other,
       savWd: src.savWd, nrWd: src.nrWd, rrspWd: src.rrspWd, tfsaWd: src.tfsaWd,
@@ -1434,28 +1436,32 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
             <thead>
               <tr className="text-slate-400 border-b border-slate-700/50">
                 {["Age","Phase","Portfolio","CPP","OAS",
-                  ...(inputs.pensionIncome > 0 ? ["Pension"] : []),
+                  ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? ["Pension"] : []),
                   ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? ["Bridge"] : []),
-                  ...(inputs.otherIncome > 0 ? ["Other"] : []),
+                  ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? ["Other"] : []),
                   "Sav Wd","NR Wd","RRSP Wd","TFSA Wd","Taxable","Tax","Clawback","Net Income"].map(h => (
                   <th key={h} className="px-2 py-2 text-right font-medium whitespace-nowrap">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {results.rows.filter(r => r.age >= retAge).map(r => (
-                <tr key={r.age} className="border-b border-slate-800/50 hover:bg-slate-700/20">
-                  <td className="px-2 py-1.5 text-white font-medium">{r.age}</td>
-                  <td className="px-2 py-1.5 text-slate-400">{r.phase}</td>
-                  {[r.totalPortfolio,r.cpp,r.oasGross,
-                    ...(inputs.pensionIncome > 0 ? [r.pension] : []),
-                    ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? [r.bridge] : []),
-                    ...(inputs.otherIncome > 0 ? [r.other] : []),
-                    r.savWd,r.nrWd,r.rrspWd,r.tfsaWd,r.taxableIncome,r.totalTax,r.oasClawback,r.netIncome].map((v,i) => (
-                    <td key={i} className="px-2 py-1.5 text-right text-slate-300">{fmtK(v)}</td>
-                  ))}
-                </tr>
-              ))}
+              {results.rows.filter(r => r.age >= retAge).map(r => {
+                const s = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
+                return (
+                  <tr key={r.age} className="border-b border-slate-800/50 hover:bg-slate-700/20">
+                    <td className="px-2 py-1.5 text-white font-medium">{r.age}</td>
+                    <td className="px-2 py-1.5 text-slate-400">{r.phase}</td>
+                    {[s.totalPortfolio ?? r.totalPortfolio, s.cpp, s.oasGross,
+                      ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? [s.pension] : []),
+                      ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? [s.bridge] : []),
+                      ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? [s.other] : []),
+                      s.savWd, s.nrWd, s.rrspWd, s.tfsaWd,
+                      s.taxableIncome ?? r.taxableIncome, s.totalTax ?? r.totalTax, s.oasClawback ?? r.oasClawback, s.netIncome ?? r.netIncome].map((v,i) => (
+                      <td key={i} className="px-2 py-1.5 text-right text-slate-300">{fmtK(v)}</td>
+                    ))}
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
