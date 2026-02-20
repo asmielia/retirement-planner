@@ -57,6 +57,32 @@ function estimateTerminalTaxRate(rrspBal, provData, fedBrackets, infFactor) {
 }
 
 // ═══════════════════════════════════════════════
+// INCOME SMOOTHING
+// ═══════════════════════════════════════════════
+function getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome) {
+  if (age < 65) return activeIncome;
+  if (age < 70) {
+    const t = (age - 65) / 5;
+    return activeIncome + (slowdownIncome - activeIncome) * t;
+  }
+  if (age < 80) return slowdownIncome;
+  if (age < 85) {
+    const t = (age - 80) / 5;
+    return slowdownIncome + (inactiveIncome - slowdownIncome) * t;
+  }
+  return inactiveIncome;
+}
+
+function getPhaseLabel(age, isRetired) {
+  if (!isRetired) return "Accumulation";
+  if (age < 65) return "Active";
+  if (age < 70) return "Active \u2192 Slow";
+  if (age < 80) return "Slowdown";
+  if (age < 85) return "Slow \u2192 Inactive";
+  return "Inactive";
+}
+
+// ═══════════════════════════════════════════════
 // CORE PROJECTION ENGINE
 // ═══════════════════════════════════════════════
 function runProjection(inputs, strategy = "optimize") {
@@ -101,7 +127,7 @@ function runProjection(inputs, strategy = "optimize") {
     if (age > lifeExpectancy) break;
     const infFactor = Math.pow(1 + inflation, year);
     const isRetired = age >= retirementAge;
-    const phase = !isRetired ? "Accumulation" : age < 70 ? "Active" : age < 85 ? "Slowdown" : "Inactive";
+    const phase = getPhaseLabel(age, isRetired);
     const growthRate = isRetired ? postGrowth : preGrowth;
 
     // Government benefits
@@ -114,10 +140,10 @@ function runProjection(inputs, strategy = "optimize") {
     const bridge = (isRetired && age < 65) ? pensionBridge : 0;
     const other = isRetired ? otherIncome * infFactor : 0;
 
-    // Desired income (nominal)
+    // Desired income (nominal) — smoothed transitions between phases
     let desiredBase = 0;
     if (isRetired) {
-      desiredBase = age < 70 ? activeIncome : age < 85 ? slowdownIncome : inactiveIncome;
+      desiredBase = getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome);
     }
     const desiredNominal = desiredBase * infFactor;
 
@@ -432,14 +458,15 @@ function runCoupleProjection(inputs, strategy = "optimize") {
 
     // Phase based on older alive partner's age
     const olderAge = youAlive && partnerAlive ? Math.max(youAge, partnerAge) : (youAlive ? youAge : partnerAge);
-    const phase = olderAge < Math.max(you.retirementAge, partner.retirementAge) ? "Accumulation" : olderAge < 70 ? "Active" : olderAge < 85 ? "Slowdown" : "Inactive";
+    const anyRetired = youRetired || partnerRetired;
+    const phase = getPhaseLabel(olderAge, anyRetired);
 
-    const growthRate = (youRetired || partnerRetired) ? inputs.postGrowth : inputs.preGrowth;
+    const growthRate = anyRetired ? inputs.postGrowth : inputs.preGrowth;
 
-    // Desired combined income
+    // Desired combined income — smoothed transitions between phases
     let desiredBase = 0;
-    if (youRetired || partnerRetired) {
-      desiredBase = olderAge < 70 ? inputs.activeIncome : olderAge < 85 ? inputs.slowdownIncome : inputs.inactiveIncome;
+    if (anyRetired) {
+      desiredBase = getSmoothedIncome(olderAge, inputs.activeIncome, inputs.slowdownIncome, inputs.inactiveIncome);
     }
     // Survivor: 60% of combined if one partner has passed
     const bothAlive = youAlive && partnerAlive;
@@ -994,8 +1021,8 @@ function Page3_Income({ inputs, setField, isCouple }) {
         subtitle={isCouple ? "How much combined annual income do you and your partner need in retirement? These are your total household spending targets." : "How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age."} />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         {[
-          { key: "activeIncome", label: "Active Phase", ages: `Retirement–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
-          { key: "slowdownIncome", label: "Slowdown Phase", ages: "70–85", icon: "🏡", desc: "Quieter lifestyle, less travel" },
+          { key: "activeIncome", label: "Active Phase", ages: `Retirement–65, ramps 65–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
+          { key: "slowdownIncome", label: "Slowdown Phase", ages: "70–80, ramps 80–85", icon: "🏡", desc: "Quieter lifestyle, less travel" },
           { key: "inactiveIncome", label: "Inactive Phase", ages: "85+", icon: "🪑", desc: "Mostly home-based, possible care costs" },
         ].map(p => (
           <div key={p.key} className="bg-slate-800/50 border border-slate-700/40 rounded-xl p-5">
@@ -1007,7 +1034,7 @@ function Page3_Income({ inputs, setField, isCouple }) {
         ))}
       </div>
       <Explanation>
-        These amounts are in today's dollars — the model automatically adjusts for inflation each year. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
+        These amounts are in today's dollars — the model automatically adjusts for inflation each year. Income transitions smoothly over 5 years between phases (ages 65–70 and 80–85) to avoid unrealistic spending cliffs. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
       </Explanation>
     </div>
   );
