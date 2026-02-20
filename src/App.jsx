@@ -644,8 +644,17 @@ function runCoupleProjection(inputs, strategy = "optimize") {
       return { taxableIncome, totalTax, oasClawback };
     }
 
-    const yTax = youRetired ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNonRegAvail, you.oasClawbackThreshold) : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
-    const pTax = partnerRetired ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNonRegAvail, partner.oasClawbackThreshold) : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+    // Compute tax for both retired AND working people (employment income is taxable)
+    const yTax = youRetired
+      ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNonRegAvail, you.oasClawbackThreshold)
+      : youAlive && youFixed.employment > 0
+        ? (() => { const ti = youFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
+        : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+    const pTax = partnerRetired
+      ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNonRegAvail, partner.oasClawbackThreshold)
+      : partnerAlive && partnerFixed.employment > 0
+        ? (() => { const ti = partnerFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
+        : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
 
     const totalTax = yTax.totalTax + pTax.totalTax;
     const totalClawback = yTax.oasClawback + pTax.oasClawback;
@@ -662,6 +671,7 @@ function runCoupleProjection(inputs, strategy = "optimize") {
       pension: youFixed.pension + partnerFixed.pension,
       bridge: youFixed.bridge + partnerFixed.bridge,
       other: youFixed.other + partnerFixed.other,
+      employment: youFixed.employment + partnerFixed.employment,
       savWd: ySavWd + pSavWd, nrWd: yNrWd + pNrWd, rrspWd: yRrspWd + pRrspWd, tfsaWd: yTfsaWd + pTfsaWd,
       taxableIncome: yTax.taxableIncome + pTax.taxableIncome,
       totalTax, oasClawback: totalClawback, netIncome,
@@ -672,12 +682,14 @@ function runCoupleProjection(inputs, strategy = "optimize") {
       you: {
         rrsp: yRrsp, tfsa: yTfsa, nonReg: yNonReg, savings: ySav, totalPortfolio: yPortfolio,
         cpp: youFixed.cpp, oasGross: youFixed.oasGross, pension: youFixed.pension, bridge: youFixed.bridge, other: youFixed.other,
+        employment: youFixed.employment,
         savWd: ySavWd, nrWd: yNrWd, rrspWd: yRrspWd, tfsaWd: yTfsaWd,
         ...yTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - yTax.totalTax - yTax.oasClawback,
       },
       partner: {
         rrsp: pRrsp, tfsa: pTfsa, nonReg: pNonReg, savings: pSav, totalPortfolio: pPortfolio,
         cpp: partnerFixed.cpp, oasGross: partnerFixed.oasGross, pension: partnerFixed.pension, bridge: partnerFixed.bridge, other: partnerFixed.other,
+        employment: partnerFixed.employment,
         savWd: pSavWd, nrWd: pNrWd, rrspWd: pRrspWd, tfsaWd: pTfsaWd,
         ...pTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - pTax.totalTax - pTax.oasClawback,
       },
@@ -1269,11 +1281,13 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
       age: r.age, portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
       rrsp: src.rrsp, tfsa: src.tfsa, nonReg: src.nonReg, savings: src.savings,
       cpp: src.cpp, oas: src.oasGross, pension: src.pension, bridge: src.bridge, other: src.other,
+      employment: src.employment ?? r.employment ?? 0,
       savWd: src.savWd, nrWd: src.nrWd, rrspWd: src.rrspWd, tfsaWd: src.tfsaWd,
       tax: src.totalTax ?? r.totalTax, clawback: src.oasClawback ?? r.oasClawback, net: src.netIncome ?? r.netIncome, desired: r.desiredNominal,
     };
   });
   const retData = chartData.filter(d => d.age >= retAge);
+  const hasEmployment = retData.some(d => d.employment > 0);
   const ttStyle = { backgroundColor: "#1e293b", border: "1px solid #334155", borderRadius: "8px", fontSize: 12 };
   const CustomTooltip = ({ active, payload, label }) => {
     if (!active || !payload?.length) return null;
@@ -1396,6 +1410,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
+            {hasEmployment && <Bar dataKey="employment" name="Employment" stackId="1" fill="#f59e0b" />}
             <Bar dataKey="cpp" name="CPP" stackId="1" fill="#1e3a5f" />
             <Bar dataKey="oas" name="OAS" stackId="1" fill="#2563eb" />
             <Bar dataKey="pension" name="Pension" stackId="1" fill="#0891b2" />
@@ -1407,13 +1422,16 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
             <Bar dataKey="tfsaWd" name="TFSA" stackId="1" fill="#a855f7" />
           </BarChart>
         </ResponsiveContainer>
-        <Explanation>CPP, OAS, pension, and other guaranteed income form the foundation. The bridge benefit covers the gap before age 65. Portfolio withdrawals fill the remainder, with the tax-optimized strategy keeping RRSP withdrawals moderate to avoid OAS clawback.</Explanation>
+        <Explanation>
+          {hasEmployment ? "Employment income from the working partner is shown until they retire. " : ""}
+          CPP, OAS, pension, and other guaranteed income form the foundation. The bridge benefit covers the gap before age 65. Portfolio withdrawals fill the remainder, with the tax-optimized strategy keeping RRSP withdrawals moderate to avoid OAS clawback.
+        </Explanation>
       </div>
 
       {/* Chart 4: Tax Impact */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
         <h3 className="text-sm font-semibold text-white mb-1">Tax & OAS Clawback</h3>
-        <p className="text-xs text-slate-400 mb-4">Annual combined federal + provincial taxes and any OAS recovery tax</p>
+        <p className="text-xs text-slate-400 mb-4">Annual combined federal + provincial taxes{hasEmployment ? " (including on employment income)" : ""} and any OAS recovery tax</p>
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
