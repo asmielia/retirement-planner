@@ -1270,15 +1270,25 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
 }
 
 function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView }) {
-  const retAge = isCouple ? Math.min(inputs.retirementAge, inputs.partner.retirementAge) : inputs.retirementAge;
+  // Determine the effective retirement age for filtering
+  const retAge = isCouple
+    ? chartView === "you" ? inputs.retirementAge
+      : chartView === "partner" ? inputs.partner.retirementAge
+      : Math.min(inputs.retirementAge, inputs.partner.retirementAge)
+    : inputs.retirementAge;
 
   const chartData = results.rows.map((r, idx) => {
     // Select data source based on chart view
     const src = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
     const portfolio = src.totalPortfolio ?? r.totalPortfolio;
     const infFactor = Math.pow(1 + (inputs.inflation || 0.02), idx + 1);
+    // Pick the correct age for the X axis
+    const displayAge = isCouple
+      ? chartView === "you" ? r.youAge : chartView === "partner" ? r.partnerAge : r.age
+      : r.age;
     return {
-      age: r.age, portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
+      age: displayAge, youAge: r.youAge, partnerAge: r.partnerAge,
+      portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
       rrsp: src.rrsp, tfsa: src.tfsa, nonReg: src.nonReg, savings: src.savings,
       cpp: src.cpp, oas: src.oasGross, pension: src.pension, bridge: src.bridge, other: src.other,
       employment: src.employment ?? r.employment ?? 0,
@@ -1288,12 +1298,35 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
   });
   const retData = chartData.filter(d => d.age >= retAge);
   const hasEmployment = retData.some(d => d.employment > 0);
+  const showDualAge = isCouple && chartView === "combined" && inputs.currentAge !== inputs.partner.currentAge;
   const ttStyle = { backgroundColor: "#1e293b", border: "1px solid #334155", borderRadius: "8px", fontSize: 12 };
+
+  // Custom X axis tick for combined couple view: show both ages
+  const DualAgeTick = ({ x, y, payload }) => {
+    const d = chartData.find(dd => dd.age === payload.value);
+    if (!d) return null;
+    return (
+      <g transform={`translate(${x},${y})`}>
+        <text x={0} y={0} dy={12} textAnchor="middle" fill="#94a3b8" fontSize={10}>{d.youAge}</text>
+        <text x={0} y={0} dy={24} textAnchor="middle" fill="#64748b" fontSize={9}>{d.partnerAge}</text>
+      </g>
+    );
+  };
+
+  const xAxisProps = showDualAge
+    ? { dataKey: "age", tick: <DualAgeTick />, height: 40, interval: "preserveStartEnd" }
+    : { dataKey: "age", tick: { fill: "#94a3b8", fontSize: 11 } };
+
   const CustomTooltip = ({ active, payload, label }) => {
     if (!active || !payload?.length) return null;
+    const d = payload[0]?.payload;
     return (
       <div style={ttStyle} className="p-3 shadow-xl">
-        <div className="text-amber-400 font-semibold mb-1">Age {label}</div>
+        {isCouple && chartView === "combined" && d ? (
+          <div className="text-amber-400 font-semibold mb-1">You: {d.youAge} / Partner: {d.partnerAge}</div>
+        ) : (
+          <div className="text-amber-400 font-semibold mb-1">Age {label}</div>
+        )}
         {payload.map((p, i) => (
           <div key={i} className="flex justify-between gap-4">
             <span style={{ color: p.color }}>{p.name}</span>
@@ -1357,6 +1390,10 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         </div>
       )}
 
+      {showDualAge && (
+        <div className="text-xs text-slate-500 mb-2 text-right">X-axis: <span className="text-slate-400">Your age</span> / <span className="text-slate-500">Partner's age</span></div>
+      )}
+
       {/* Chart 1: Portfolio */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
         <h3 className="text-sm font-semibold text-white mb-1">Portfolio Value Over Time</h3>
@@ -1368,7 +1405,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
               <linearGradient id="gReal" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#22c55e" stopOpacity={0.3}/><stop offset="95%" stopColor="#22c55e" stopOpacity={0}/></linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1386,7 +1423,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         <ResponsiveContainer width="100%" height={300}>
           <AreaChart data={chartData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1406,7 +1443,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1435,7 +1472,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1453,26 +1490,37 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
           <table className="w-full text-xs">
             <thead>
               <tr className="text-slate-400 border-b border-slate-700/50">
-                {["Age","Phase","Portfolio","CPP","OAS",
+                {[...(isCouple && chartView === "combined" ? ["You","Partner"] : ["Age"]),
+                  "Phase","Portfolio","CPP","OAS",
                   ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? ["Pension"] : []),
                   ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? ["Bridge"] : []),
                   ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? ["Other"] : []),
+                  ...(hasEmployment ? ["Employ"] : []),
                   "Sav Wd","NR Wd","RRSP Wd","TFSA Wd","Taxable","Tax","Clawback","Net Income"].map(h => (
                   <th key={h} className="px-2 py-2 text-right font-medium whitespace-nowrap">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {results.rows.filter(r => r.age >= retAge).map(r => {
+              {results.rows.filter(r => {
+                const dispAge = isCouple && chartView === "you" ? r.youAge : isCouple && chartView === "partner" ? r.partnerAge : r.age;
+                return dispAge >= retAge;
+              }).map(r => {
                 const s = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
+                const dispAge = isCouple && chartView === "you" ? r.youAge : isCouple && chartView === "partner" ? r.partnerAge : r.age;
                 return (
                   <tr key={r.age} className="border-b border-slate-800/50 hover:bg-slate-700/20">
-                    <td className="px-2 py-1.5 text-white font-medium">{r.age}</td>
+                    {isCouple && chartView === "combined" ? (
+                      <><td className="px-2 py-1.5 text-white font-medium">{r.youAge}</td><td className="px-2 py-1.5 text-slate-400">{r.partnerAge}</td></>
+                    ) : (
+                      <td className="px-2 py-1.5 text-white font-medium">{dispAge}</td>
+                    )}
                     <td className="px-2 py-1.5 text-slate-400">{r.phase}</td>
                     {[s.totalPortfolio ?? r.totalPortfolio, s.cpp, s.oasGross,
                       ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? [s.pension] : []),
                       ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? [s.bridge] : []),
                       ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? [s.other] : []),
+                      ...(hasEmployment ? [s.employment ?? r.employment ?? 0] : []),
                       s.savWd, s.nrWd, s.rrspWd, s.tfsaWd,
                       s.taxableIncome ?? r.taxableIncome, s.totalTax ?? r.totalTax, s.oasClawback ?? r.oasClawback, s.netIncome ?? r.netIncome].map((v,i) => (
                       <td key={i} className="px-2 py-1.5 text-right text-slate-300">{fmtK(v)}</td>
