@@ -57,6 +57,32 @@ function estimateTerminalTaxRate(rrspBal, provData, fedBrackets, infFactor) {
 }
 
 // ═══════════════════════════════════════════════
+// INCOME SMOOTHING
+// ═══════════════════════════════════════════════
+function getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome) {
+  if (age < 65) return activeIncome;
+  if (age < 70) {
+    const t = (age - 65) / 5;
+    return activeIncome + (slowdownIncome - activeIncome) * t;
+  }
+  if (age < 80) return slowdownIncome;
+  if (age < 85) {
+    const t = (age - 80) / 5;
+    return slowdownIncome + (inactiveIncome - slowdownIncome) * t;
+  }
+  return inactiveIncome;
+}
+
+function getPhaseLabel(age, isRetired) {
+  if (!isRetired) return "Accumulation";
+  if (age < 65) return "Active";
+  if (age < 70) return "Active \u2192 Slow";
+  if (age < 80) return "Slowdown";
+  if (age < 85) return "Slow \u2192 Inactive";
+  return "Inactive";
+}
+
+// ═══════════════════════════════════════════════
 // CORE PROJECTION ENGINE
 // ═══════════════════════════════════════════════
 function runProjection(inputs, strategy = "optimize") {
@@ -101,7 +127,7 @@ function runProjection(inputs, strategy = "optimize") {
     if (age > lifeExpectancy) break;
     const infFactor = Math.pow(1 + inflation, year);
     const isRetired = age >= retirementAge;
-    const phase = !isRetired ? "Accumulation" : age < 70 ? "Active" : age < 85 ? "Slowdown" : "Inactive";
+    const phase = getPhaseLabel(age, isRetired);
     const growthRate = isRetired ? postGrowth : preGrowth;
 
     // Government benefits
@@ -114,10 +140,10 @@ function runProjection(inputs, strategy = "optimize") {
     const bridge = (isRetired && age < 65) ? pensionBridge : 0;
     const other = isRetired ? otherIncome * infFactor : 0;
 
-    // Desired income (nominal)
+    // Desired income (nominal) — smoothed transitions between phases
     let desiredBase = 0;
     if (isRetired) {
-      desiredBase = age < 70 ? activeIncome : age < 85 ? slowdownIncome : inactiveIncome;
+      desiredBase = getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome);
     }
     const desiredNominal = desiredBase * infFactor;
 
@@ -432,14 +458,15 @@ function runCoupleProjection(inputs, strategy = "optimize") {
 
     // Phase based on older alive partner's age
     const olderAge = youAlive && partnerAlive ? Math.max(youAge, partnerAge) : (youAlive ? youAge : partnerAge);
-    const phase = olderAge < Math.max(you.retirementAge, partner.retirementAge) ? "Accumulation" : olderAge < 70 ? "Active" : olderAge < 85 ? "Slowdown" : "Inactive";
+    const anyRetired = youRetired || partnerRetired;
+    const phase = getPhaseLabel(olderAge, anyRetired);
 
-    const growthRate = (youRetired || partnerRetired) ? inputs.postGrowth : inputs.preGrowth;
+    const growthRate = anyRetired ? inputs.postGrowth : inputs.preGrowth;
 
-    // Desired combined income
+    // Desired combined income — smoothed transitions between phases
     let desiredBase = 0;
-    if (youRetired || partnerRetired) {
-      desiredBase = olderAge < 70 ? inputs.activeIncome : olderAge < 85 ? inputs.slowdownIncome : inputs.inactiveIncome;
+    if (anyRetired) {
+      desiredBase = getSmoothedIncome(olderAge, inputs.activeIncome, inputs.slowdownIncome, inputs.inactiveIncome);
     }
     // Survivor: 60% of combined if one partner has passed
     const bothAlive = youAlive && partnerAlive;
@@ -644,8 +671,17 @@ function runCoupleProjection(inputs, strategy = "optimize") {
       return { taxableIncome, totalTax, oasClawback };
     }
 
-    const yTax = youRetired ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNonRegAvail, you.oasClawbackThreshold) : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
-    const pTax = partnerRetired ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNonRegAvail, partner.oasClawbackThreshold) : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+    // Compute tax for both retired AND working people (employment income is taxable)
+    const yTax = youRetired
+      ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNonRegAvail, you.oasClawbackThreshold)
+      : youAlive && youFixed.employment > 0
+        ? (() => { const ti = youFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
+        : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+    const pTax = partnerRetired
+      ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNonRegAvail, partner.oasClawbackThreshold)
+      : partnerAlive && partnerFixed.employment > 0
+        ? (() => { const ti = partnerFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
+        : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
 
     const totalTax = yTax.totalTax + pTax.totalTax;
     const totalClawback = yTax.oasClawback + pTax.oasClawback;
@@ -662,6 +698,7 @@ function runCoupleProjection(inputs, strategy = "optimize") {
       pension: youFixed.pension + partnerFixed.pension,
       bridge: youFixed.bridge + partnerFixed.bridge,
       other: youFixed.other + partnerFixed.other,
+      employment: youFixed.employment + partnerFixed.employment,
       savWd: ySavWd + pSavWd, nrWd: yNrWd + pNrWd, rrspWd: yRrspWd + pRrspWd, tfsaWd: yTfsaWd + pTfsaWd,
       taxableIncome: yTax.taxableIncome + pTax.taxableIncome,
       totalTax, oasClawback: totalClawback, netIncome,
@@ -672,12 +709,14 @@ function runCoupleProjection(inputs, strategy = "optimize") {
       you: {
         rrsp: yRrsp, tfsa: yTfsa, nonReg: yNonReg, savings: ySav, totalPortfolio: yPortfolio,
         cpp: youFixed.cpp, oasGross: youFixed.oasGross, pension: youFixed.pension, bridge: youFixed.bridge, other: youFixed.other,
+        employment: youFixed.employment,
         savWd: ySavWd, nrWd: yNrWd, rrspWd: yRrspWd, tfsaWd: yTfsaWd,
         ...yTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - yTax.totalTax - yTax.oasClawback,
       },
       partner: {
         rrsp: pRrsp, tfsa: pTfsa, nonReg: pNonReg, savings: pSav, totalPortfolio: pPortfolio,
         cpp: partnerFixed.cpp, oasGross: partnerFixed.oasGross, pension: partnerFixed.pension, bridge: partnerFixed.bridge, other: partnerFixed.other,
+        employment: partnerFixed.employment,
         savWd: pSavWd, nrWd: pNrWd, rrspWd: pRrspWd, tfsaWd: pTfsaWd,
         ...pTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - pTax.totalTax - pTax.oasClawback,
       },
@@ -982,8 +1021,8 @@ function Page3_Income({ inputs, setField, isCouple }) {
         subtitle={isCouple ? "How much combined annual income do you and your partner need in retirement? These are your total household spending targets." : "How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age."} />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         {[
-          { key: "activeIncome", label: "Active Phase", ages: `Retirement–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
-          { key: "slowdownIncome", label: "Slowdown Phase", ages: "70–85", icon: "🏡", desc: "Quieter lifestyle, less travel" },
+          { key: "activeIncome", label: "Active Phase", ages: `Retirement–65, ramps 65–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
+          { key: "slowdownIncome", label: "Slowdown Phase", ages: "70–80, ramps 80–85", icon: "🏡", desc: "Quieter lifestyle, less travel" },
           { key: "inactiveIncome", label: "Inactive Phase", ages: "85+", icon: "🪑", desc: "Mostly home-based, possible care costs" },
         ].map(p => (
           <div key={p.key} className="bg-slate-800/50 border border-slate-700/40 rounded-xl p-5">
@@ -995,7 +1034,7 @@ function Page3_Income({ inputs, setField, isCouple }) {
         ))}
       </div>
       <Explanation>
-        These amounts are in today's dollars — the model automatically adjusts for inflation each year. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
+        These amounts are in today's dollars — the model automatically adjusts for inflation each year. Income transitions smoothly over 5 years between phases (ages 65–70 and 80–85) to avoid unrealistic spending cliffs. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
       </Explanation>
     </div>
   );
@@ -1258,28 +1297,63 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
 }
 
 function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView }) {
-  const retAge = isCouple ? Math.min(inputs.retirementAge, inputs.partner.retirementAge) : inputs.retirementAge;
+  // Determine the effective retirement age for filtering
+  const retAge = isCouple
+    ? chartView === "you" ? inputs.retirementAge
+      : chartView === "partner" ? inputs.partner.retirementAge
+      : Math.min(inputs.retirementAge, inputs.partner.retirementAge)
+    : inputs.retirementAge;
 
   const chartData = results.rows.map((r, idx) => {
     // Select data source based on chart view
     const src = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
     const portfolio = src.totalPortfolio ?? r.totalPortfolio;
     const infFactor = Math.pow(1 + (inputs.inflation || 0.02), idx + 1);
+    // Pick the correct age for the X axis
+    const displayAge = isCouple
+      ? chartView === "you" ? r.youAge : chartView === "partner" ? r.partnerAge : r.age
+      : r.age;
     return {
-      age: r.age, portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
+      age: displayAge, youAge: r.youAge, partnerAge: r.partnerAge,
+      portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
       rrsp: src.rrsp, tfsa: src.tfsa, nonReg: src.nonReg, savings: src.savings,
       cpp: src.cpp, oas: src.oasGross, pension: src.pension, bridge: src.bridge, other: src.other,
+      employment: src.employment ?? r.employment ?? 0,
       savWd: src.savWd, nrWd: src.nrWd, rrspWd: src.rrspWd, tfsaWd: src.tfsaWd,
       tax: src.totalTax ?? r.totalTax, clawback: src.oasClawback ?? r.oasClawback, net: src.netIncome ?? r.netIncome, desired: r.desiredNominal,
     };
   });
   const retData = chartData.filter(d => d.age >= retAge);
+  const hasEmployment = retData.some(d => d.employment > 0);
+  const showDualAge = isCouple && chartView === "combined" && inputs.currentAge !== inputs.partner.currentAge;
   const ttStyle = { backgroundColor: "#1e293b", border: "1px solid #334155", borderRadius: "8px", fontSize: 12 };
+
+  // Custom X axis tick for combined couple view: show both ages
+  const DualAgeTick = ({ x, y, payload }) => {
+    const d = chartData.find(dd => dd.age === payload.value);
+    if (!d) return null;
+    return (
+      <g transform={`translate(${x},${y})`}>
+        <text x={0} y={0} dy={12} textAnchor="middle" fill="#94a3b8" fontSize={10}>{d.youAge}</text>
+        <text x={0} y={0} dy={24} textAnchor="middle" fill="#64748b" fontSize={9}>{d.partnerAge}</text>
+      </g>
+    );
+  };
+
+  const xAxisProps = showDualAge
+    ? { dataKey: "age", tick: <DualAgeTick />, height: 40, interval: "preserveStartEnd" }
+    : { dataKey: "age", tick: { fill: "#94a3b8", fontSize: 11 } };
+
   const CustomTooltip = ({ active, payload, label }) => {
     if (!active || !payload?.length) return null;
+    const d = payload[0]?.payload;
     return (
       <div style={ttStyle} className="p-3 shadow-xl">
-        <div className="text-amber-400 font-semibold mb-1">Age {label}</div>
+        {isCouple && chartView === "combined" && d ? (
+          <div className="text-amber-400 font-semibold mb-1">You: {d.youAge} / Partner: {d.partnerAge}</div>
+        ) : (
+          <div className="text-amber-400 font-semibold mb-1">Age {label}</div>
+        )}
         {payload.map((p, i) => (
           <div key={i} className="flex justify-between gap-4">
             <span style={{ color: p.color }}>{p.name}</span>
@@ -1343,6 +1417,10 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         </div>
       )}
 
+      {showDualAge && (
+        <div className="text-xs text-slate-500 mb-2 text-right">X-axis: <span className="text-slate-400">Your age</span> / <span className="text-slate-500">Partner's age</span></div>
+      )}
+
       {/* Chart 1: Portfolio */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
         <h3 className="text-sm font-semibold text-white mb-1">Portfolio Value Over Time</h3>
@@ -1354,7 +1432,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
               <linearGradient id="gReal" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#22c55e" stopOpacity={0.3}/><stop offset="95%" stopColor="#22c55e" stopOpacity={0}/></linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1372,7 +1450,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         <ResponsiveContainer width="100%" height={300}>
           <AreaChart data={chartData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1392,10 +1470,11 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
+            {hasEmployment && <Bar dataKey="employment" name="Employment" stackId="1" fill="#f59e0b" />}
             <Bar dataKey="cpp" name="CPP" stackId="1" fill="#1e3a5f" />
             <Bar dataKey="oas" name="OAS" stackId="1" fill="#2563eb" />
             <Bar dataKey="pension" name="Pension" stackId="1" fill="#0891b2" />
@@ -1407,17 +1486,20 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
             <Bar dataKey="tfsaWd" name="TFSA" stackId="1" fill="#a855f7" />
           </BarChart>
         </ResponsiveContainer>
-        <Explanation>CPP, OAS, pension, and other guaranteed income form the foundation. The bridge benefit covers the gap before age 65. Portfolio withdrawals fill the remainder, with the tax-optimized strategy keeping RRSP withdrawals moderate to avoid OAS clawback.</Explanation>
+        <Explanation>
+          {hasEmployment ? "Employment income from the working partner is shown until they retire. " : ""}
+          CPP, OAS, pension, and other guaranteed income form the foundation. The bridge benefit covers the gap before age 65. Portfolio withdrawals fill the remainder, with the tax-optimized strategy keeping RRSP withdrawals moderate to avoid OAS clawback.
+        </Explanation>
       </div>
 
       {/* Chart 4: Tax Impact */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
         <h3 className="text-sm font-semibold text-white mb-1">Tax & OAS Clawback</h3>
-        <p className="text-xs text-slate-400 mb-4">Annual combined federal + provincial taxes and any OAS recovery tax</p>
+        <p className="text-xs text-slate-400 mb-4">Annual combined federal + provincial taxes{hasEmployment ? " (including on employment income)" : ""} and any OAS recovery tax</p>
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="age" tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <XAxis {...xAxisProps} />
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -1435,26 +1517,37 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
           <table className="w-full text-xs">
             <thead>
               <tr className="text-slate-400 border-b border-slate-700/50">
-                {["Age","Phase","Portfolio","CPP","OAS",
+                {[...(isCouple && chartView === "combined" ? ["You","Partner"] : ["Age"]),
+                  "Phase","Portfolio","CPP","OAS",
                   ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? ["Pension"] : []),
                   ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? ["Bridge"] : []),
                   ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? ["Other"] : []),
+                  ...(hasEmployment ? ["Employ"] : []),
                   "Sav Wd","NR Wd","RRSP Wd","TFSA Wd","Taxable","Tax","Clawback","Net Income"].map(h => (
                   <th key={h} className="px-2 py-2 text-right font-medium whitespace-nowrap">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {results.rows.filter(r => r.age >= retAge).map(r => {
+              {results.rows.filter(r => {
+                const dispAge = isCouple && chartView === "you" ? r.youAge : isCouple && chartView === "partner" ? r.partnerAge : r.age;
+                return dispAge >= retAge;
+              }).map(r => {
                 const s = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
+                const dispAge = isCouple && chartView === "you" ? r.youAge : isCouple && chartView === "partner" ? r.partnerAge : r.age;
                 return (
                   <tr key={r.age} className="border-b border-slate-800/50 hover:bg-slate-700/20">
-                    <td className="px-2 py-1.5 text-white font-medium">{r.age}</td>
+                    {isCouple && chartView === "combined" ? (
+                      <><td className="px-2 py-1.5 text-white font-medium">{r.youAge}</td><td className="px-2 py-1.5 text-slate-400">{r.partnerAge}</td></>
+                    ) : (
+                      <td className="px-2 py-1.5 text-white font-medium">{dispAge}</td>
+                    )}
                     <td className="px-2 py-1.5 text-slate-400">{r.phase}</td>
                     {[s.totalPortfolio ?? r.totalPortfolio, s.cpp, s.oasGross,
                       ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? [s.pension] : []),
                       ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? [s.bridge] : []),
                       ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? [s.other] : []),
+                      ...(hasEmployment ? [s.employment ?? r.employment ?? 0] : []),
                       s.savWd, s.nrWd, s.rrspWd, s.tfsaWd,
                       s.taxableIncome ?? r.taxableIncome, s.totalTax ?? r.totalTax, s.oasClawback ?? r.oasClawback, s.netIncome ?? r.netIncome].map((v,i) => (
                       <td key={i} className="px-2 py-1.5 text-right text-slate-300">{fmtK(v)}</td>
