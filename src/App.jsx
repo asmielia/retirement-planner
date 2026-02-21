@@ -834,6 +834,17 @@ const fmtK = (n) => {
 const pct = (n) => (n * 100).toFixed(1) + "%";
 
 // ═══════════════════════════════════════════════
+// NAME HELPERS
+// ═══════════════════════════════════════════════
+function getNames(inputs) {
+  const youName = inputs.name || "You";
+  const partnerName = inputs.partner?.name || "Your Partner";
+  const youPossessive = inputs.name ? `${inputs.name}'s` : "Your";
+  const partnerPossessive = inputs.partner?.name ? `${inputs.partner.name}'s` : "Your Partner's";
+  return { youName, partnerName, youPossessive, partnerPossessive };
+}
+
+// ═══════════════════════════════════════════════
 // UI COMPONENTS
 // ═══════════════════════════════════════════════
 
@@ -862,6 +873,22 @@ function Field({ label, value, onChange, type = "currency", min, max, step, hint
         />
         {type === "percent" && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-amber-400/60 text-sm">%</span>}
       </div>
+      {hint && <p className="text-xs text-slate-500 mt-1">{hint}</p>}
+    </div>
+  );
+}
+
+function TextField({ label, value, onChange, placeholder, hint }) {
+  return (
+    <div className="mb-4">
+      <label className="block text-sm font-medium text-slate-300 mb-1.5 tracking-wide">{label}</label>
+      <input
+        type="text"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="w-full bg-slate-800/80 border border-slate-600/50 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-amber-400/50 focus:border-amber-400/50 transition-all placeholder:text-slate-600"
+      />
       {hint && <p className="text-xs text-slate-500 mt-1">{hint}</p>}
     </div>
   );
@@ -913,12 +940,13 @@ function Explanation({ children }) {
 // PAGES
 // ═══════════════════════════════════════════════
 
-function Page1_Personal({ inputs, setField, personTab, isCouple, activePerson, activeSetField }) {
-  const who = isCouple ? (personTab === "partner" ? "Your Partner's" : "Your") : "Your";
+function Page1_Personal({ inputs, setField, personTab, isCouple, activePerson, activeSetField, names }) {
+  const who = isCouple ? (personTab === "partner" ? names.partnerPossessive : names.youPossessive) : names.youPossessive;
+  const whoLower = isCouple ? (personTab === "partner" ? (inputs.partner?.name ? `${inputs.partner.name}'s` : "your partner's") : (inputs.name ? `${inputs.name}'s` : "your")) : (inputs.name ? `${inputs.name}'s` : "your");
   return (
     <div>
-      <SectionTitle icon="🍁" title={isCouple ? `${personTab === "partner" ? "Your Partner's" : "Your"} Details` : "Let's Plan Your Retirement"}
-        subtitle={isCouple ? `Enter ${personTab === "partner" ? "your partner's" : "your"} personal details.` : "We'll start with some basics about you. These determine the time horizon for your savings to grow and how long your retirement income needs to last."} />
+      <SectionTitle icon="🍁" title={isCouple ? `${who} Details` : "Let's Plan Your Retirement"}
+        subtitle={isCouple ? `Enter ${whoLower} personal details.` : "We'll start with some basics about you. These determine the time horizon for your savings to grow and how long your retirement income needs to last."} />
 
       {/* Mode selector — only show on "You" tab */}
       {(!isCouple || personTab === "you") && (
@@ -946,6 +974,13 @@ function Page1_Personal({ inputs, setField, personTab, isCouple, activePerson, a
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
         <div>
+          <TextField
+            label={isCouple ? (personTab === "partner" ? "Partner's Name" : "Your Name") : "Your Name"}
+            value={personTab === "partner" ? (inputs.partner?.name || "") : (inputs.name || "")}
+            onChange={v => personTab === "partner" ? activeSetField("name", v) : setField("name", v)}
+            placeholder="Optional — leave blank for default labels"
+            hint="Used in labels and results for sharing with others"
+          />
           <Field label={`${who} Current Age`} value={activePerson.currentAge} onChange={v => activeSetField("currentAge", v)} type="number" min={18} max={80} hint="How old are you today?" />
           <Field label={`${who} Desired Retirement Age`} value={activePerson.retirementAge} onChange={v => activeSetField("retirementAge", v)} type="number" min={50} max={75} hint="When do you want to stop working?" />
           <Field label={`${who} Life Expectancy`} value={activePerson.lifeExpectancy} onChange={v => activeSetField("lifeExpectancy", v)} type="number" min={70} max={105} hint="Plan conservatively — the average Canadian lives to 82" />
@@ -975,14 +1010,16 @@ function Page1_Personal({ inputs, setField, personTab, isCouple, activePerson, a
   );
 }
 
-function Page2_Balances({ inputs, setField, personTab, isCouple, activePerson, activeSetField }) {
+function Page2_Balances({ inputs, setField, personTab, isCouple, activePerson, activeSetField, names }) {
   const total = activePerson.rrspBal + activePerson.tfsaBal + activePerson.nonRegBal + activePerson.savingsBal;
   const totalContrib = activePerson.rrspContrib + activePerson.tfsaContrib + activePerson.nonRegContrib + activePerson.savingsContrib;
-  const who = isCouple ? (personTab === "partner" ? "Your Partner's" : "Your") : "Your";
+  const who = isCouple ? (personTab === "partner" ? names.partnerPossessive : names.youPossessive) : names.youPossessive;
+  const whoLower = isCouple ? (personTab === "partner" ? (inputs.partner?.name ? `${inputs.partner.name}'s` : "your partner's") : (inputs.name ? `${inputs.name}'s` : "your")) : (inputs.name ? `${inputs.name}'s` : "your");
+  const whoContrib = isCouple && personTab === "partner" ? (inputs.partner?.name ? `${inputs.partner.name} contributes` : "they contribute") : (inputs.name ? `${inputs.name} contributes` : "you contribute");
   return (
     <div>
       <SectionTitle icon="💰" title={`${who} Savings Today`}
-        subtitle={`Enter ${isCouple && personTab === "partner" ? "your partner's" : "your"} current account balances and how much ${isCouple && personTab === "partner" ? "they contribute" : "you contribute"} each year.`} />
+        subtitle={`Enter ${whoLower} current account balances and how much ${whoContrib} each year.`} />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8">
         <div>
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-4">Current Balances</h3>
@@ -1014,11 +1051,17 @@ function Page2_Balances({ inputs, setField, personTab, isCouple, activePerson, a
   );
 }
 
-function Page3_Income({ inputs, setField, isCouple }) {
+function Page3_Income({ inputs, setField, isCouple, names }) {
+  const coupleTitle = inputs.name && inputs.partner?.name
+    ? `${inputs.name} & ${inputs.partner.name}'s Retirement Lifestyle`
+    : "Your Combined Retirement Lifestyle";
+  const coupleSubtitle = inputs.name && inputs.partner?.name
+    ? `How much combined annual income do ${inputs.name} and ${inputs.partner.name} need in retirement? These are your total household spending targets.`
+    : "How much combined annual income do you and your partner need in retirement? These are your total household spending targets.";
   return (
     <div>
-      <SectionTitle icon="🏖️" title={isCouple ? "Your Combined Retirement Lifestyle" : "Your Retirement Lifestyle"}
-        subtitle={isCouple ? "How much combined annual income do you and your partner need in retirement? These are your total household spending targets." : "How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age."} />
+      <SectionTitle icon="🏖️" title={isCouple ? coupleTitle : `${names.youPossessive} Retirement Lifestyle`}
+        subtitle={isCouple ? coupleSubtitle : "How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age."} />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         {[
           { key: "activeIncome", label: "Active Phase", ages: `Retirement–65, ramps 65–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
@@ -1079,15 +1122,16 @@ function Page4_Rates({ inputs, setField }) {
   );
 }
 
-function Page5_CPP({ inputs, setField, personTab, isCouple, activePerson, activeSetField, results }) {
+function Page5_CPP({ inputs, setField, personTab, isCouple, activePerson, activeSetField, results, names }) {
   const showBridge = activePerson.retirementAge < 65;
-  const who = isCouple ? (personTab === "partner" ? "Your Partner's" : "Your") : "";
+  const who = isCouple ? (personTab === "partner" ? names.partnerPossessive : names.youPossessive) : "";
+  const whoLower = isCouple ? (personTab === "partner" ? (inputs.partner?.name ? `${inputs.partner.name}'s` : "your partner's") : (inputs.name ? `${inputs.name}'s` : "your")) : (inputs.name ? `${inputs.name}'s` : "your");
   // For couple mode, use per-person CPP/OAS results
   const personResults = isCouple ? (personTab === "partner" ? results.partnerResults : results.youResults) : results;
   return (
     <div>
       <SectionTitle icon="🏛️" title={`${who ? who + " " : ""}CPP, OAS & Pension`}
-        subtitle={`Government benefits and employer pensions form the foundation of ${isCouple && personTab === "partner" ? "your partner's" : "your"} retirement income.`} />
+        subtitle={`Government benefits and employer pensions form the foundation of ${whoLower} retirement income.`} />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 mb-6">
         <div>
           <Field label="CPP Annual Amount at Age 65 (Today's $)" value={activePerson.cppAt65} onChange={v => activeSetField("cppAt65", v)} hint="2025 max: $17,196. Check your My Service Canada Account for your estimate." />
@@ -1155,7 +1199,7 @@ function Page5_CPP({ inputs, setField, personTab, isCouple, activePerson, active
   );
 }
 
-function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple }) {
+function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple, names }) {
   const status = results.fundingRatio >= 1 ? { icon: "✅", text: "Plan is On Track", color: "text-emerald-400" }
     : results.fundingRatio >= 0.7 ? { icon: "⚠️", text: "Needs Improvement", color: "text-amber-400" }
     : { icon: "❌", text: "Plan is Unrealistic", color: "text-red-400" };
@@ -1167,7 +1211,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
 
   return (
     <div>
-      <SectionTitle icon="📋" title="Your Retirement Summary"
+      <SectionTitle icon="📋" title={`${names.youPossessive} Retirement Summary`}
         subtitle="Here's the big picture — how your plan holds up across all the years ahead." />
 
       {/* Status banner */}
@@ -1181,9 +1225,9 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
       {results.hasSurplus && (
         <div className="bg-slate-800/60 border border-amber-400/30 rounded-xl p-5 mb-8">
           <div className="text-sm font-semibold text-amber-400 mb-1">
-            Your plan has a surplus — choose how to use it:
+            {inputs.name ? `${inputs.name}'s` : "Your"} plan has a surplus — choose how to use it:
           </div>
-          <div className="text-xs text-slate-400 mb-4">Your savings outlast your retirement. You can spend more each year or leave a larger inheritance.</div>
+          <div className="text-xs text-slate-400 mb-4">{inputs.name ? `${inputs.name}'s savings outlast` : "Your savings outlast"} {isCouple ? "the" : inputs.name ? "the" : "your"} retirement. You can spend more each year or leave a larger inheritance.</div>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {[
               { key: "max_estate", label: "Maximize Estate", icon: "🏠", desc: "Optimize withdrawals to leave the largest possible post-tax inheritance" },
@@ -1221,7 +1265,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
               sub={`was ${fmt(inputs.inactiveIncome)} (+${Math.round((results.spendingMultiplier - 1) * 100)}%)`} accent />
           </div>
           <Explanation>
-            By increasing your spending by {Math.round((results.spendingMultiplier - 1) * 100)}% across all phases, your {isCouple ? "combined portfolios are" : "portfolio is"} projected to be fully utilized by the end of the plan. These amounts are in today's dollars and will be inflation-adjusted each year.
+            By increasing spending by {Math.round((results.spendingMultiplier - 1) * 100)}% across all phases, the {isCouple ? "combined portfolios are" : "portfolio is"} projected to be fully utilized by the end of the plan. These amounts are in today's dollars and will be inflation-adjusted each year.
           </Explanation>
         </div>
       )}
@@ -1265,11 +1309,11 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
           <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Guaranteed Income</h3>
           {isCouple ? (
             <div className="space-y-2 text-sm text-slate-300">
-              <div className="text-xs text-slate-500 uppercase tracking-wider font-semibold">You</div>
+              <div className="text-xs text-slate-500 uppercase tracking-wider font-semibold">{names.youName}</div>
               <div className="flex justify-between"><span>CPP at age {results.youResults.optCpp.age}</span><span className="text-white font-semibold">{fmt(results.youResults.optCpp.annual)}/yr</span></div>
               <div className="flex justify-between"><span>OAS at age {results.youResults.optOas.age}</span><span className="text-white font-semibold">{fmt(results.youResults.optOas.annual)}/yr</span></div>
               {inputs.pensionIncome > 0 && <div className="flex justify-between"><span>Pension</span><span className="text-white font-semibold">{fmt(inputs.pensionIncome)}/yr</span></div>}
-              <div className="text-xs text-slate-500 uppercase tracking-wider font-semibold mt-3 pt-2 border-t border-slate-700/40">Your Partner</div>
+              <div className="text-xs text-slate-500 uppercase tracking-wider font-semibold mt-3 pt-2 border-t border-slate-700/40">{names.partnerName}</div>
               <div className="flex justify-between"><span>CPP at age {results.partnerResults.optCpp.age}</span><span className="text-white font-semibold">{fmt(results.partnerResults.optCpp.annual)}/yr</span></div>
               <div className="flex justify-between"><span>OAS at age {results.partnerResults.optOas.age}</span><span className="text-white font-semibold">{fmt(results.partnerResults.optOas.annual)}/yr</span></div>
               {inputs.partner.pensionIncome > 0 && <div className="flex justify-between"><span>Pension</span><span className="text-white font-semibold">{fmt(inputs.partner.pensionIncome)}/yr</span></div>}
@@ -1296,7 +1340,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple 
   );
 }
 
-function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView }) {
+function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView, names }) {
   // Determine the effective retirement age for filtering
   const retAge = isCouple
     ? chartView === "you" ? inputs.retirementAge
@@ -1350,7 +1394,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
     return (
       <div style={ttStyle} className="p-3 shadow-xl">
         {isCouple && chartView === "combined" && d ? (
-          <div className="text-amber-400 font-semibold mb-1">You: {d.youAge} / Partner: {d.partnerAge}</div>
+          <div className="text-amber-400 font-semibold mb-1">{names.youName}: {d.youAge} / {names.partnerName}: {d.partnerAge}</div>
         ) : (
           <div className="text-amber-400 font-semibold mb-1">Age {label}</div>
         )}
@@ -1401,8 +1445,8 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
           <span className="text-sm text-slate-400">View:</span>
           {[
             { key: "combined", label: "Combined" },
-            { key: "you", label: "You" },
-            { key: "partner", label: "Partner" },
+            { key: "you", label: names.youName },
+            { key: "partner", label: names.partnerName },
           ].map(opt => (
             <button key={opt.key}
               onClick={() => setChartView(opt.key)}
@@ -1418,7 +1462,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
       )}
 
       {showDualAge && (
-        <div className="text-xs text-slate-500 mb-2 text-right">X-axis: <span className="text-slate-400">Your age</span> / <span className="text-slate-500">Partner's age</span></div>
+        <div className="text-xs text-slate-500 mb-2 text-right">X-axis: <span className="text-slate-400">{names.youPossessive} age</span> / <span className="text-slate-500">{names.partnerPossessive} age</span></div>
       )}
 
       {/* Chart 1: Portfolio */}
@@ -1517,7 +1561,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
           <table className="w-full text-xs">
             <thead>
               <tr className="text-slate-400 border-b border-slate-700/50">
-                {[...(isCouple && chartView === "combined" ? ["You","Partner"] : ["Age"]),
+                {[...(isCouple && chartView === "combined" ? [names.youName, names.partnerName] : ["Age"]),
                   "Phase","Portfolio","CPP","OAS",
                   ...(inputs.pensionIncome > 0 || (isCouple && inputs.partner.pensionIncome > 0) ? ["Pension"] : []),
                   ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? ["Bridge"] : []),
@@ -1567,6 +1611,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
 // MAIN APP
 // ═══════════════════════════════════════════════
 const PARTNER_DEFAULTS = {
+  name: "",
   currentAge: 35, retirementAge: 65, lifeExpectancy: 90, employmentIncome: 0,
   rrspBal: 50000, tfsaBal: 40000, nonRegBal: 20000, savingsBal: 15000,
   rrspContrib: 10000, tfsaContrib: 7000, nonRegContrib: 5000, savingsContrib: 3000,
@@ -1575,7 +1620,7 @@ const PARTNER_DEFAULTS = {
 };
 
 const DEFAULTS = {
-  mode: "single",
+  mode: "single", name: "",
   currentAge: 35, retirementAge: 65, lifeExpectancy: 90, province: "Ontario",
   employmentIncome: 0,
   rrspBal: 50000, tfsaBal: 40000, nonRegBal: 20000, savingsBal: 15000,
@@ -1725,15 +1770,16 @@ export default function App() {
   // Per-person helpers for current tab
   const activePerson = personTab === "partner" ? inputs.partner : inputs;
   const activeSetField = personTab === "partner" ? setPartnerField : setField;
+  const names = getNames(inputs);
 
   const pages = [
-    <Page1_Personal inputs={inputs} setField={setField} setPartnerField={setPartnerField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} />,
-    <Page2_Balances inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} />,
-    <Page5_CPP inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} results={results} />,
+    <Page1_Personal inputs={inputs} setField={setField} setPartnerField={setPartnerField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} names={names} />,
+    <Page2_Balances inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} names={names} />,
+    <Page5_CPP inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} results={results} names={names} />,
     <Page4_Rates inputs={inputs} setField={setField} />,
-    <Page3_Income inputs={inputs} setField={setField} isCouple={isCouple} />,
-    <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} />,
-    <Page7_Charts inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} />,
+    <Page3_Income inputs={inputs} setField={setField} isCouple={isCouple} names={names} />,
+    <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} names={names} />,
+    <Page7_Charts inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} names={names} />,
   ];
 
   // Next button label
@@ -1741,7 +1787,7 @@ export default function App() {
   const isSecondLastPage = page === PAGES.length - 2;
   let nextLabel = isSecondLastPage ? "See Results →" : "Next →";
   if (isCouple && currentPageDef?.perPerson && personTab === "you") {
-    nextLabel = "Next: Your Partner →";
+    nextLabel = `Next: ${names.partnerName} →`;
   }
 
   // Back button disabled state
@@ -1775,8 +1821,8 @@ export default function App() {
         <div className="sticky top-[52px] z-40 bg-slate-900/95 backdrop-blur border-b border-slate-800/60">
           <div className="max-w-5xl mx-auto px-4 py-2 flex items-center justify-center gap-2">
             {[
-              { key: "you", label: "You" },
-              { key: "partner", label: "Your Partner" },
+              { key: "you", label: names.youName },
+              { key: "partner", label: names.partnerName },
             ].map(opt => (
               <button key={opt.key}
                 onClick={() => setPersonTab(opt.key)}
