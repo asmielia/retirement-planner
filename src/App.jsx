@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid } from "recharts";
+import { compressToEncodedURIComponent, decompressFromEncodedURIComponent } from "lz-string";
 
 // ═══════════════════════════════════════════════
 // PROVINCE TAX DATA
@@ -916,12 +917,13 @@ function StatCard({ label, value, sub, accent }) {
   );
 }
 
-function SectionTitle({ icon, title, subtitle }) {
+function SectionTitle({ icon, title, subtitle, action }) {
   return (
     <div className="mb-8">
       <div className="flex items-center gap-3 mb-2">
         <span className="text-3xl">{icon}</span>
         <h2 className="text-2xl font-bold text-white" style={{ fontFamily: "'Playfair Display', serif" }}>{title}</h2>
+        {action && <div className="ml-auto">{action}</div>}
       </div>
       {subtitle && <p className="text-slate-400 text-sm leading-relaxed max-w-2xl">{subtitle}</p>}
     </div>
@@ -933,6 +935,39 @@ function Explanation({ children }) {
     <div className="bg-slate-800/40 border-l-2 border-amber-400/40 rounded-r-lg px-4 py-3 my-4">
       <p className="text-sm text-slate-300 leading-relaxed">{children}</p>
     </div>
+  );
+}
+
+function ShareButton({ inputs, surplusMode }) {
+  const [copied, setCopied] = useState(false);
+  const handleShare = async () => {
+    const encoded = encodeShareData(inputs, surplusMode);
+    const url = `${window.location.origin}${window.location.pathname}?share=${encoded}`;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      const t = document.createElement("textarea");
+      t.value = url;
+      document.body.appendChild(t);
+      t.select();
+      document.execCommand("copy");
+      document.body.removeChild(t);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+  return (
+    <button
+      onClick={handleShare}
+      disabled={copied}
+      className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-1.5 whitespace-nowrap ${
+        copied
+          ? "bg-emerald-400/15 text-emerald-400 border border-emerald-400/40 cursor-default"
+          : "bg-slate-800/60 text-slate-400 border border-slate-700/40 hover:text-white hover:border-slate-600"
+      }`}>
+      <span>{copied ? "✓" : "🔗"}</span>
+      <span>{copied ? "Copied to clipboard" : "Share"}</span>
+    </button>
   );
 }
 
@@ -1199,7 +1234,7 @@ function Page5_CPP({ inputs, setField, personTab, isCouple, activePerson, active
   );
 }
 
-function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple, names }) {
+function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple, names, isSharedView }) {
   const status = results.fundingRatio >= 1 ? { icon: "✅", text: "Plan is On Track", color: "text-emerald-400" }
     : results.fundingRatio >= 0.7 ? { icon: "⚠️", text: "Needs Improvement", color: "text-amber-400" }
     : { icon: "❌", text: "Plan is Unrealistic", color: "text-red-400" };
@@ -1212,7 +1247,8 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple,
   return (
     <div>
       <SectionTitle icon="📋" title={`${names.youPossessive} Retirement Summary`}
-        subtitle="Here's the big picture — how your plan holds up across all the years ahead." />
+        subtitle="Here's the big picture — how your plan holds up across all the years ahead."
+        action={!isSharedView && <ShareButton inputs={inputs} surplusMode={surplusMode} />} />
 
       {/* Status banner */}
       <div className={`rounded-xl p-6 mb-8 text-center border ${results.fundingRatio >= 1 ? "bg-emerald-900/20 border-emerald-400/30" : results.fundingRatio >= 0.7 ? "bg-amber-900/20 border-amber-400/30" : "bg-red-900/20 border-red-400/30"}`}>
@@ -1647,6 +1683,30 @@ const STORAGE_KEY = "retirement-planner-inputs";
 const SURPLUS_STORAGE_KEY = "retirement-planner-surplus-mode";
 const PAGE_STORAGE_KEY = "retirement-planner-page";
 
+function encodeShareData(inputs, surplusMode) {
+  const { fedBrackets, ...rest } = inputs;
+  return compressToEncodedURIComponent(JSON.stringify({ ...rest, surplusMode }));
+}
+
+function decodeShareData(encoded) {
+  try {
+    const json = decompressFromEncodedURIComponent(encoded);
+    if (!json) return null;
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== "object") return null;
+    const { surplusMode, ...fields } = parsed;
+    return {
+      inputs: {
+        ...DEFAULTS,
+        ...fields,
+        fedBrackets: DEFAULTS.fedBrackets,
+        partner: { ...PARTNER_DEFAULTS, ...(fields.partner || {}) },
+      },
+      surplusMode: surplusMode || "max_estate",
+    };
+  } catch (e) { return null; }
+}
+
 function loadSavedInputs() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -1674,6 +1734,7 @@ function loadSurplusMode() {
 
 export default function App() {
   const [page, setPage] = useState(() => {
+    if (new URLSearchParams(window.location.search).get("share")) return 5;
     try {
       const saved = parseInt(localStorage.getItem(PAGE_STORAGE_KEY));
       if (saved >= 0 && saved < PAGES.length) return saved;
@@ -1685,27 +1746,39 @@ export default function App() {
   const [personTab, setPersonTab] = useState("you");
   const [chartView, setChartView] = useState("combined");
 
+  // Shared URL state — parsed once on mount, never written to localStorage
+  const [sharedData, setSharedData] = useState(() => {
+    const encoded = new URLSearchParams(window.location.search).get("share");
+    return encoded ? decodeShareData(encoded) : null;
+  });
+  const isSharedView = sharedData !== null;
+  const effectiveInputs = isSharedView ? sharedData.inputs : inputs;
+  const effectiveSurplusMode = isSharedView ? sharedData.surplusMode : surplusMode;
+
   // Persist inputs to localStorage
   useEffect(() => {
+    if (isSharedView) return;
     try {
       const { fedBrackets, ...rest } = inputs;
       localStorage.setItem(STORAGE_KEY, JSON.stringify(rest));
     } catch (e) { /* storage full or unavailable */ }
-  }, [inputs]);
+  }, [inputs, isSharedView]);
 
   // Persist surplus mode
   useEffect(() => {
+    if (isSharedView) return;
     try {
       localStorage.setItem(SURPLUS_STORAGE_KEY, surplusMode);
     } catch (e) { /* ignore */ }
-  }, [surplusMode]);
+  }, [surplusMode, isSharedView]);
 
   // Persist current page
   useEffect(() => {
+    if (isSharedView) return;
     try {
       localStorage.setItem(PAGE_STORAGE_KEY, page);
     } catch (e) { /* ignore */ }
-  }, [page]);
+  }, [page, isSharedView]);
 
   const setField = useCallback((key, value) => {
     setInputs(prev => ({ ...prev, [key]: value }));
@@ -1715,31 +1788,31 @@ export default function App() {
     setInputs(prev => ({ ...prev, partner: { ...prev.partner, [key]: value } }));
   }, []);
 
-  const isCouple = inputs.mode === "couple";
+  const isCouple = effectiveInputs.mode === "couple";
   const currentPageDef = PAGES[page];
 
   const results = useMemo(() => {
     if (isCouple) {
-      const fundingRatio = findCoupleFundingRatio(inputs);
-      const base = runCoupleProjection(inputs);
+      const fundingRatio = findCoupleFundingRatio(effectiveInputs);
+      const base = runCoupleProjection(effectiveInputs);
       if (!base.hasSurplus) {
         return { ...base, surplusMode: null, fundingRatio };
       }
-      if (surplusMode === "boost_spending") {
-        return { ...runCoupleBoostSpending(inputs), fundingRatio };
+      if (effectiveSurplusMode === "boost_spending") {
+        return { ...runCoupleBoostSpending(effectiveInputs), fundingRatio };
       }
-      return { ...runCoupleMaxEstate(inputs), fundingRatio };
+      return { ...runCoupleMaxEstate(effectiveInputs), fundingRatio };
     }
-    const fundingRatio = findFundingRatio(inputs);
-    const base = runProjection(inputs);
+    const fundingRatio = findFundingRatio(effectiveInputs);
+    const base = runProjection(effectiveInputs);
     if (!base.hasSurplus) {
       return { ...base, surplusMode: null, fundingRatio };
     }
-    if (surplusMode === "boost_spending") {
-      return { ...runBoostSpending(inputs), fundingRatio };
+    if (effectiveSurplusMode === "boost_spending") {
+      return { ...runBoostSpending(effectiveInputs), fundingRatio };
     }
-    return { ...runMaxEstate(inputs), fundingRatio };
-  }, [inputs, surplusMode, isCouple]);
+    return { ...runMaxEstate(effectiveInputs), fundingRatio };
+  }, [effectiveInputs, effectiveSurplusMode, isCouple]);
 
   const scrollTop = () => setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 0);
 
@@ -1768,18 +1841,18 @@ export default function App() {
   }, [isCouple, currentPageDef, personTab]);
 
   // Per-person helpers for current tab
-  const activePerson = personTab === "partner" ? inputs.partner : inputs;
+  const activePerson = personTab === "partner" ? effectiveInputs.partner : effectiveInputs;
   const activeSetField = personTab === "partner" ? setPartnerField : setField;
-  const names = getNames(inputs);
+  const names = getNames(effectiveInputs);
 
   const pages = [
-    <Page1_Personal inputs={inputs} setField={setField} setPartnerField={setPartnerField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} names={names} />,
-    <Page2_Balances inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} names={names} />,
-    <Page5_CPP inputs={inputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} results={results} names={names} />,
-    <Page4_Rates inputs={inputs} setField={setField} />,
-    <Page3_Income inputs={inputs} setField={setField} isCouple={isCouple} names={names} />,
-    <Page6_Results inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} names={names} />,
-    <Page7_Charts inputs={inputs} results={results} surplusMode={surplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} names={names} />,
+    <Page1_Personal inputs={effectiveInputs} setField={setField} setPartnerField={setPartnerField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} names={names} />,
+    <Page2_Balances inputs={effectiveInputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} names={names} />,
+    <Page5_CPP inputs={effectiveInputs} setField={setField} personTab={personTab} isCouple={isCouple} activePerson={activePerson} activeSetField={activeSetField} results={results} names={names} />,
+    <Page4_Rates inputs={effectiveInputs} setField={setField} />,
+    <Page3_Income inputs={effectiveInputs} setField={setField} isCouple={isCouple} names={names} />,
+    <Page6_Results inputs={effectiveInputs} results={results} surplusMode={effectiveSurplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} names={names} isSharedView={isSharedView} />,
+    <Page7_Charts inputs={effectiveInputs} results={results} surplusMode={effectiveSurplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} names={names} />,
   ];
 
   // Next button label
@@ -1840,6 +1913,21 @@ export default function App() {
 
       {/* Page content */}
       <div className="max-w-5xl mx-auto px-4 py-8">
+        {isSharedView && (
+          <div className="bg-blue-900/30 border border-blue-400/30 rounded-xl p-4 mb-6 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">🔗</span>
+              <span className="text-sm text-blue-300">
+                You're viewing {names.youPossessive} shared retirement plan.
+              </span>
+            </div>
+            <button
+              onClick={() => { setSharedData(null); window.history.replaceState({}, "", window.location.pathname); setPage(0); }}
+              className="px-3 py-1 rounded-lg text-xs font-medium bg-slate-800/60 text-slate-400 border border-slate-700/40 hover:text-white hover:border-slate-600 transition-all whitespace-nowrap">
+              View My Plan
+            </button>
+          </div>
+        )}
         <div key={`${page}-${personTab}`} className="animate-fadeIn">{pages[page]}</div>
 
         {/* Navigation */}
