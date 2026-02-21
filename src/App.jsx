@@ -1376,7 +1376,7 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple,
   );
 }
 
-function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView, names }) {
+function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView, names, isSharedView }) {
   // Determine the effective retirement age for filtering
   const retAge = isCouple
     ? chartView === "you" ? inputs.retirementAge
@@ -1447,7 +1447,8 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
   return (
     <div>
       <SectionTitle icon="📈" title="Detailed Projections"
-        subtitle="Visual breakdowns of how your wealth grows, where your retirement income comes from, and how tax optimization protects your money." />
+        subtitle="Visual breakdowns of how your wealth grows, where your retirement income comes from, and how tax optimization protects your money."
+        action={!isSharedView && <ShareButton inputs={inputs} surplusMode={surplusMode} />} />
 
       {/* Sticky surplus mode toggle */}
       {results.hasSurplus && (
@@ -1852,7 +1853,7 @@ export default function App() {
     <Page4_Rates inputs={effectiveInputs} setField={setField} />,
     <Page3_Income inputs={effectiveInputs} setField={setField} isCouple={isCouple} names={names} />,
     <Page6_Results inputs={effectiveInputs} results={results} surplusMode={effectiveSurplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} names={names} isSharedView={isSharedView} />,
-    <Page7_Charts inputs={effectiveInputs} results={results} surplusMode={effectiveSurplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} names={names} />,
+    <Page7_Charts inputs={effectiveInputs} results={results} surplusMode={effectiveSurplusMode} setSurplusMode={setSurplusMode} isCouple={isCouple} chartView={chartView} setChartView={setChartView} names={names} isSharedView={isSharedView} />,
   ];
 
   // Next button label
@@ -1942,6 +1943,9 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      {/* Version footer */}
+      <div className="text-center py-4 text-xs text-slate-600">v{__APP_VERSION__}</div>
 
       <style>{`
         @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
