@@ -377,6 +377,27 @@ function runMaxEstate(inputs) {
   };
 }
 
+function runRetireEarly(inputs) {
+  let lo = inputs.currentAge + 1;
+  let hi = inputs.retirementAge;
+  for (let i = 0; i < 20; i++) {
+    const mid = Math.round((lo + hi) / 2);
+    if (mid === hi) break;
+    const result = runProjection({ ...inputs, retirementAge: mid });
+    const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
+    if (endBal > 0) hi = mid; else lo = mid + 1;
+  }
+  const finalResult = runProjection({ ...inputs, retirementAge: hi });
+  return {
+    ...finalResult,
+    surplusMode: "retire_early",
+    hasSurplus: true,
+    earlyRetirementAge: hi,
+    originalRetirementAge: inputs.retirementAge,
+    yearsSaved: inputs.retirementAge - hi,
+  };
+}
+
 // Find the max spending multiplier — this IS the funding ratio
 // 1.0 = exactly funded, 1.3 = can spend 30% more, 0.7 = can only afford 70%
 function findFundingRatio(inputs) {
@@ -819,6 +840,69 @@ function runCoupleMaxEstate(inputs) {
   return { ...result, surplusMode: "max_estate", hasSurplus: true };
 }
 
+function runCoupleRetireEarly(inputs) {
+  const youYearsToRetire = inputs.retirementAge - inputs.currentAge;
+  const partnerYearsToRetire = inputs.partner.retirementAge - inputs.partner.currentAge;
+  let youRetAge = inputs.retirementAge;
+  let partnerRetAge = inputs.partner.retirementAge;
+
+  function isFunded(yAge, pAge) {
+    const test = { ...inputs, retirementAge: yAge, partner: { ...inputs.partner, retirementAge: pAge } };
+    const r = runCoupleProjection(test);
+    return (r.rows[r.rows.length - 1]?.totalPortfolio ?? 0) > 0;
+  }
+
+  // Phase 1: Align retirement years by reducing the later-retiring partner
+  if (youYearsToRetire > partnerYearsToRetire) {
+    const alignedAge = inputs.currentAge + partnerYearsToRetire;
+    let lo = Math.max(inputs.currentAge + 1, alignedAge);
+    let hi = youRetAge;
+    for (let i = 0; i < 20; i++) {
+      const mid = Math.round((lo + hi) / 2);
+      if (mid === hi) break;
+      if (isFunded(mid, partnerRetAge)) hi = mid; else lo = mid + 1;
+    }
+    youRetAge = hi;
+  } else if (partnerYearsToRetire > youYearsToRetire) {
+    const alignedAge = inputs.partner.currentAge + youYearsToRetire;
+    let lo = Math.max(inputs.partner.currentAge + 1, alignedAge);
+    let hi = partnerRetAge;
+    for (let i = 0; i < 20; i++) {
+      const mid = Math.round((lo + hi) / 2);
+      if (mid === hi) break;
+      if (isFunded(youRetAge, mid)) hi = mid; else lo = mid + 1;
+    }
+    partnerRetAge = hi;
+  }
+
+  // Phase 2: Reduce both retirement ages together
+  const maxReduction = Math.min(youRetAge - (inputs.currentAge + 1), partnerRetAge - (inputs.partner.currentAge + 1));
+  if (maxReduction > 0) {
+    let lo = 0, hi = maxReduction;
+    for (let i = 0; i < 20; i++) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (mid === lo) break;
+      if (isFunded(youRetAge - mid, partnerRetAge - mid)) lo = mid; else hi = mid - 1;
+    }
+    youRetAge -= lo;
+    partnerRetAge -= lo;
+  }
+
+  const earlyInputs = { ...inputs, retirementAge: youRetAge, partner: { ...inputs.partner, retirementAge: partnerRetAge } };
+  const finalResult = runCoupleProjection(earlyInputs);
+  return {
+    ...finalResult,
+    surplusMode: "retire_early",
+    hasSurplus: true,
+    earlyYouRetirementAge: youRetAge,
+    earlyPartnerRetirementAge: partnerRetAge,
+    originalYouRetirementAge: inputs.retirementAge,
+    originalPartnerRetirementAge: inputs.partner.retirementAge,
+    youYearsSaved: inputs.retirementAge - youRetAge,
+    partnerYearsSaved: inputs.partner.retirementAge - partnerRetAge,
+  };
+}
+
 // ═══════════════════════════════════════════════
 // FORMATTING HELPERS
 // ═══════════════════════════════════════════════
@@ -1239,7 +1323,12 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple,
     : results.fundingRatio >= 0.7 ? { icon: "⚠️", text: "Needs Improvement", color: "text-amber-400" }
     : { icon: "❌", text: "Plan is Unrealistic", color: "text-red-400" };
 
-  const retRows = results.rows.filter(r => r.age >= inputs.retirementAge);
+  const effectiveRetAge = surplusMode === "retire_early"
+    ? (isCouple ? Math.min(results.earlyYouRetirementAge ?? inputs.retirementAge, results.earlyPartnerRetirementAge ?? inputs.partner.retirementAge)
+               : (results.earlyRetirementAge ?? inputs.retirementAge))
+    : (isCouple ? Math.min(inputs.retirementAge, inputs.partner.retirementAge)
+               : inputs.retirementAge);
+  const retRows = results.rows.filter(r => r.age >= effectiveRetAge);
   const totalTaxPaid = retRows.reduce((s, r) => s + r.totalTax, 0);
   const totalClawback = retRows.reduce((s, r) => s + r.oasClawback, 0);
   const lastRow = results.rows[results.rows.length - 1];
@@ -1263,11 +1352,12 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple,
           <div className="text-sm font-semibold text-amber-400 mb-1">
             {inputs.name ? `${inputs.name}'s` : "Your"} plan has a surplus — choose how to use it:
           </div>
-          <div className="text-xs text-slate-400 mb-4">{inputs.name ? `${inputs.name}'s savings outlast` : "Your savings outlast"} {isCouple ? "the" : inputs.name ? "the" : "your"} retirement. You can spend more each year or leave a larger inheritance.</div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="text-xs text-slate-400 mb-4">{inputs.name ? `${inputs.name}'s savings outlast` : "Your savings outlast"} {isCouple ? "the" : inputs.name ? "the" : "your"} retirement. You can spend more, leave a larger inheritance, or retire sooner.</div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             {[
               { key: "max_estate", label: "Maximize Estate", icon: "🏠", desc: "Optimize withdrawals to leave the largest possible post-tax inheritance" },
               { key: "boost_spending", label: "Increase Spending", icon: "✈️", desc: "Proportionally increase retirement income so funds are fully used by end of life" },
+              { key: "retire_early", label: "Retire Earlier", icon: "⏰", desc: "Lower retirement age to the earliest point where the plan is still fully funded" },
             ].map(opt => (
               <button key={opt.key}
                 onClick={() => setSurplusMode(opt.key)}
@@ -1323,8 +1413,47 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple,
         </div>
       )}
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+      {/* Early retirement display */}
+      {surplusMode === "retire_early" && (results.earlyRetirementAge != null || results.earlyYouRetirementAge != null) && (
+        <div className="mb-8">
+          <h3 className="text-sm font-semibold text-amber-400/80 uppercase tracking-widest mb-3">Early Retirement</h3>
+          {isCouple ? (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <StatCard label={`${names.youName} New Age`} value={results.earlyYouRetirementAge} accent />
+                <StatCard label={`${names.partnerName} New Age`} value={results.earlyPartnerRetirementAge} accent />
+                <StatCard label={`${names.youName} Saved`} value={`${results.youYearsSaved} yr${results.youYearsSaved !== 1 ? "s" : ""}`} />
+                <StatCard label={`${names.partnerName} Saved`} value={`${results.partnerYearsSaved} yr${results.partnerYearsSaved !== 1 ? "s" : ""}`} />
+              </div>
+              <Explanation>
+                {names.youName} can retire at {results.earlyYouRetirementAge} (saving {results.youYearsSaved} year{results.youYearsSaved !== 1 ? "s" : ""}) and {names.partnerName} at {results.earlyPartnerRetirementAge} (saving {results.partnerYearsSaved} year{results.partnerYearsSaved !== 1 ? "s" : ""}), while keeping the plan fully funded. Spending targets remain the same.
+              </Explanation>
+            </>
+          ) : (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <StatCard label="New Retirement Age" value={results.earlyRetirementAge} accent />
+                <StatCard label="Original Retirement Age" value={results.originalRetirementAge} />
+                <StatCard label="Years Saved" value={results.yearsSaved} accent />
+              </div>
+              <Explanation>
+                By retiring at age {results.earlyRetirementAge} instead of {results.originalRetirementAge}, {results.yearsSaved} year{results.yearsSaved !== 1 ? "s" : ""} of work {results.yearsSaved !== 1 ? "are" : "is"} saved while keeping the plan fully funded through age {inputs.lifeExpectancy}. Spending targets remain the same.
+              </Explanation>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
         <StatCard label="Portfolio at Retirement" value={fmtK(results.portfolioAtRet)} accent />
+        {isCouple ? (
+          <StatCard label="Retirement Ages"
+            value={`${surplusMode === "retire_early" && results.earlyYouRetirementAge != null ? results.earlyYouRetirementAge : inputs.retirementAge} / ${surplusMode === "retire_early" && results.earlyPartnerRetirementAge != null ? results.earlyPartnerRetirementAge : inputs.partner.retirementAge}`}
+            sub={`${names.youName} / ${names.partnerName}`} />
+        ) : (
+          <StatCard label="Retirement Age"
+            value={surplusMode === "retire_early" && results.earlyRetirementAge != null ? results.earlyRetirementAge : inputs.retirementAge} />
+        )}
         <StatCard label="Portfolio at End" value={fmtK(lastRow?.totalPortfolio)} sub={`Age ${inputs.lifeExpectancy}`} />
         <StatCard label="Total Tax Paid" value={fmtK(totalTaxPaid)} sub="Over retirement" />
         <StatCard label="OAS Clawback" value={totalClawback > 0 ? fmtK(totalClawback) : "$0"} sub={totalClawback > 0 ? "Lost to clawback" : "Fully avoided ✓"} accent={totalClawback === 0} />
@@ -1378,11 +1507,17 @@ function Page6_Results({ inputs, results, surplusMode, setSurplusMode, isCouple,
 
 function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, chartView, setChartView, names, isSharedView }) {
   // Determine the effective retirement age for filtering
+  const youRetAge = surplusMode === "retire_early" && results.earlyYouRetirementAge != null
+    ? results.earlyYouRetirementAge
+    : surplusMode === "retire_early" && results.earlyRetirementAge != null
+      ? results.earlyRetirementAge : inputs.retirementAge;
+  const pRetAge = surplusMode === "retire_early" && results.earlyPartnerRetirementAge != null
+    ? results.earlyPartnerRetirementAge : inputs.partner?.retirementAge;
   const retAge = isCouple
-    ? chartView === "you" ? inputs.retirementAge
-      : chartView === "partner" ? inputs.partner.retirementAge
-      : Math.min(inputs.retirementAge, inputs.partner.retirementAge)
-    : inputs.retirementAge;
+    ? chartView === "you" ? youRetAge
+      : chartView === "partner" ? pRetAge
+      : Math.min(youRetAge, pRetAge)
+    : youRetAge;
 
   const chartData = results.rows.map((r, idx) => {
     // Select data source based on chart view
@@ -1459,6 +1594,7 @@ function Page7_Charts({ inputs, results, surplusMode, setSurplusMode, isCouple, 
               {[
                 { key: "max_estate", label: "Maximize Estate", icon: "🏠" },
                 { key: "boost_spending", label: "Increase Spending", icon: "✈️" },
+                { key: "retire_early", label: "Retire Earlier", icon: "⏰" },
               ].map(opt => (
                 <button key={opt.key}
                   onClick={() => setSurplusMode(opt.key)}
@@ -1728,7 +1864,7 @@ function loadSavedInputs() {
 function loadSurplusMode() {
   try {
     const saved = localStorage.getItem(SURPLUS_STORAGE_KEY);
-    if (saved === "boost_spending" || saved === "max_estate") return saved;
+    if (saved === "boost_spending" || saved === "max_estate" || saved === "retire_early") return saved;
   } catch (e) { /* ignore */ }
   return "max_estate";
 }
@@ -1802,6 +1938,9 @@ export default function App() {
       if (effectiveSurplusMode === "boost_spending") {
         return { ...runCoupleBoostSpending(effectiveInputs), fundingRatio };
       }
+      if (effectiveSurplusMode === "retire_early") {
+        return { ...runCoupleRetireEarly(effectiveInputs), fundingRatio };
+      }
       return { ...runCoupleMaxEstate(effectiveInputs), fundingRatio };
     }
     const fundingRatio = findFundingRatio(effectiveInputs);
@@ -1811,6 +1950,9 @@ export default function App() {
     }
     if (effectiveSurplusMode === "boost_spending") {
       return { ...runBoostSpending(effectiveInputs), fundingRatio };
+    }
+    if (effectiveSurplusMode === "retire_early") {
+      return { ...runRetireEarly(effectiveInputs), fundingRatio };
     }
     return { ...runMaxEstate(effectiveInputs), fundingRatio };
   }, [effectiveInputs, effectiveSurplusMode, isCouple]);
