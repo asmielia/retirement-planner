@@ -39,6 +39,10 @@ export function runProjection(inputs, strategy = "optimize") {
     cppAt65, oasAt65, oasClawbackThreshold,
     fedBrackets } = inputs;
 
+  // originalRetirementAge gates pension/bridge (DB pension starts at originally planned age)
+  // retirementAge gates when portfolio withdrawals and desired spending begin
+  const originalRetirementAge = inputs.originalRetirementAge || retirementAge;
+
   const provData = PROVINCES[province] || PROVINCES.Ontario;
 
   // CPP optimization (ages 60-70)
@@ -66,6 +70,7 @@ export function runProjection(inputs, strategy = "optimize") {
   const rows = [];
   let rrsp = rrspBal, tfsa = tfsaBal, nonReg = nonRegBal, savings = savingsBal;
   let tfsaRoom = 0; // TFSA contribution room starts at 0 today
+  let nonRegCostBasis = nonRegBal; // track cost basis for capital gains calculation
 
   for (let year = 1; year <= (lifeExpectancy - currentAge + 1); year++) {
     const age = currentAge + year - 1;
@@ -79,10 +84,11 @@ export function runProjection(inputs, strategy = "optimize") {
     const cpp = age >= optCpp.age ? optCpp.annual * infFactor : 0;
     const oasGross = age >= optOas.age ? optOas.annual * infFactor : 0;
 
-    // Pension and bridge are fixed nominal amounts (most DB pensions are not indexed to inflation)
-    // Other income (rental, part-time, etc.) is inflation-adjusted
-    const pension = isRetired ? pensionIncome : 0;
-    const bridge = (isRetired && age < 65) ? pensionBridge : 0;
+    // Pension starts at age 65 (DB pension benefit age).
+    // Bridge benefit covers the gap from originally planned retirement to age 65.
+    // Other income (rental, part-time, etc.) is inflation-adjusted and starts at retirement.
+    const pension = age >= 65 ? pensionIncome : 0;
+    const bridge = (age >= originalRetirementAge && age < 65) ? pensionBridge : 0;
     const other = isRetired ? otherIncome * infFactor : 0;
 
     // Desired income (nominal) — smoothed transitions between phases
@@ -186,15 +192,23 @@ export function runProjection(inputs, strategy = "optimize") {
       }
     }
 
+    // Non-reg capital gains: compute gain fraction BEFORE updating cost basis
+    // Only the gain portion of the withdrawal is taxable at 50% inclusion
+    const nrGainFraction = nonRegAvail > 0 ? Math.max(0, 1 - nonRegCostBasis / nonRegAvail) : 0;
+    const nrTaxableGain = nrWd * nrGainFraction * 0.5;
+
+    // The RRSP top-up excess is an internal rebalance, not spendable income.
+    const rrspToTfsaTransfer = isRetired ? Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed) : 0;
+
     // Update balances
     // TFSA contribution room: $7K/year accrues, withdrawals restore room
     tfsaRoom += 7000;
     if (isRetired) {
       tfsaRoom += tfsaWd; // withdrawals restore contribution room
 
-      // RRSP top-up excess (withdrawn beyond spending need) goes to TFSA up to
-      // available contribution room. Any overflow goes to non-registered.
-      const extraFromTopUp = Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed);
+      // RRSP top-up excess goes to TFSA up to available contribution room.
+      // Any overflow goes to non-registered.
+      const extraFromTopUp = rrspToTfsaTransfer;
       const toTfsa = Math.min(extraFromTopUp, tfsaRoom);
       const toNonReg = extraFromTopUp - toTfsa;
       tfsaRoom -= toTfsa;
@@ -203,22 +217,26 @@ export function runProjection(inputs, strategy = "optimize") {
       tfsa = Math.max(0, tfsaAvail - tfsaWd) + toTfsa;
       nonReg = Math.max(0, nonRegAvail - nrWd) + toNonReg;
       savings = Math.max(0, savAvail - savWd);
+      // Update cost basis: reduce proportionally on withdrawal, increase by top-up overflow
+      if (nonRegAvail > 0 && nrWd > 0) {
+        nonRegCostBasis = nonRegCostBasis * (1 - nrWd / nonRegAvail) + toNonReg;
+      } else {
+        nonRegCostBasis += toNonReg;
+      }
     } else {
       tfsaRoom -= tfsaContrib; // pre-retirement contributions use room
       rrsp = rrsp * (1 + preGrowth) + rrspContrib;
       tfsa = tfsa * (1 + preGrowth) + tfsaContrib;
       nonReg = nonReg * (1 + preGrowth) + nonRegContrib;
+      nonRegCostBasis += nonRegContrib; // new contributions are at cost
       savings = savings + savingsContrib;
     }
 
     const totalPortfolio = rrsp + tfsa + nonReg + savings;
 
-    // The RRSP top-up excess is an internal RRSP→TFSA rebalance, not spendable income.
-    // Track it so charts can show only the spending portion of withdrawals.
-    const rrspToTfsaTransfer = isRetired ? Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed) : 0;
-
-    // Taxable income (tax is computed on the full RRSP withdrawal including top-up)
-    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + Math.max(0, nonRegAvail * postGrowth * 0.5) : 0;
+    // Taxable income includes full RRSP withdrawal (including top-up rebalance),
+    // because the top-up IS real taxable income that the user pays tax on.
+    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain : 0;
 
     // Tax calculation
     const fedTax = isRetired ? calcProgressiveTax(taxableIncome, fedBpa, fedBrk) : 0;
@@ -228,7 +246,8 @@ export function runProjection(inputs, strategy = "optimize") {
     // OAS clawback
     const oasClawback = isRetired ? Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15)) : 0;
 
-    // Net income — excludes the RRSP→TFSA rebalance since it's not spendable
+    // Net income — total income minus tax, minus OAS clawback, minus the RRSP top-up
+    // transfer (which went to TFSA/non-reg and is not spendable cash)
     const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback - rrspToTfsaTransfer : 0;
 
     rows.push({
