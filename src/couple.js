@@ -81,9 +81,9 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
 
       const cpp = pAge >= optCpp.age ? optCpp.annual * infFactor : 0;
       const oasGross = pAge >= optOas.age ? optOas.annual * infFactor : 0;
-      // Pension starts at age 65 (DB pension benefit age).
+      // Pension starts at the originally planned retirement age (DB pension benefit).
       // Bridge covers gap from originally planned retirement age to 65.
-      const pension = pAge >= 65 ? p.pensionIncome : 0;
+      const pension = pAge >= p.originalRetirementAge ? p.pensionIncome : 0;
       const bridge = (pAge >= p.originalRetirementAge && pAge < 65) ? p.pensionBridge : 0;
       const other = pRetired ? p.otherIncome * infFactor : 0;
       const employment = !pRetired ? (p.employmentIncome || 0) * infFactor : 0;

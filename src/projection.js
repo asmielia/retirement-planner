@@ -84,10 +84,10 @@ export function runProjection(inputs, strategy = "optimize") {
     const cpp = age >= optCpp.age ? optCpp.annual * infFactor : 0;
     const oasGross = age >= optOas.age ? optOas.annual * infFactor : 0;
 
-    // Pension starts at age 65 (DB pension benefit age).
+    // Pension starts at the originally planned retirement age (DB pension benefit).
     // Bridge benefit covers the gap from originally planned retirement to age 65.
     // Other income (rental, part-time, etc.) is inflation-adjusted and starts at retirement.
-    const pension = age >= 65 ? pensionIncome : 0;
+    const pension = age >= originalRetirementAge ? pensionIncome : 0;
     const bridge = (age >= originalRetirementAge && age < 65) ? pensionBridge : 0;
     const other = isRetired ? otherIncome * infFactor : 0;
 
