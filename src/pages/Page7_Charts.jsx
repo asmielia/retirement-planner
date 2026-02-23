@@ -31,6 +31,9 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
       employment: src.employment ?? r.employment ?? 0,
       savWd: src.savWd, nrWd: src.nrWd, rrspWd: src.rrspWd, tfsaWd: src.tfsaWd,
       tax: src.totalTax ?? r.totalTax, clawback: src.oasClawback ?? r.oasClawback, net: src.netIncome ?? r.netIncome, desired: r.desiredNominal,
+      // Per-partner breakdowns for couple mode
+      youTax: r.you?.totalTax ?? 0, youClawback: r.you?.oasClawback ?? 0, youNet: r.you?.netIncome ?? 0,
+      partnerTax: r.partner?.totalTax ?? 0, partnerClawback: r.partner?.oasClawback ?? 0, partnerNet: r.partner?.netIncome ?? 0,
     };
   });
   const retData = chartData.filter(d => d.age >= retAge);
@@ -176,8 +179,8 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
 
       {/* Chart 3: Income Sources */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
-        <h3 className="text-sm font-semibold text-white mb-1">Retirement Income Sources</h3>
-        <p className="text-xs text-slate-400 mb-4">Where your retirement income comes from each year</p>
+        <h3 className="text-sm font-semibold text-white mb-1">Gross Retirement Income Sources</h3>
+        <p className="text-xs text-slate-400 mb-4">Where your retirement income comes from each year (before tax)</p>
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
@@ -203,10 +206,10 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
         </Explanation>
       </div>
 
-      {/* Chart 4: Tax Impact */}
+      {/* Chart 3b: Net Retirement Income */}
       <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
-        <h3 className="text-sm font-semibold text-white mb-1">Tax & OAS Clawback</h3>
-        <p className="text-xs text-slate-400 mb-4">Annual combined federal + provincial taxes{hasEmployment ? " (including on employment income)" : ""} and any OAS recovery tax</p>
+        <h3 className="text-sm font-semibold text-white mb-1">Net Retirement Income</h3>
+        <p className="text-xs text-slate-400 mb-4">Take-home income after federal + provincial tax and OAS clawback{isCouple ? ", broken down per partner" : ""}</p>
         <ResponsiveContainer width="100%" height={300}>
           <BarChart data={retData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
@@ -214,8 +217,43 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
             <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
             <Tooltip content={<CustomTooltip />} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
-            <Bar dataKey="tax" name="Fed + Prov Tax" stackId="1" fill="#dc2626" />
-            <Bar dataKey="clawback" name="OAS Clawback" stackId="1" fill="#f97316" />
+            {isCouple && chartView === "combined" ? (
+              <>
+                <Bar dataKey="youNet" name={names.youName} stackId="1" fill="#2563eb" />
+                <Bar dataKey="partnerNet" name={names.partnerName} stackId="1" fill="#22c55e" />
+              </>
+            ) : (
+              <Bar dataKey="net" name="Net Income" fill="#22c55e" />
+            )}
+          </BarChart>
+        </ResponsiveContainer>
+        <Explanation>This is your actual spendable income — what remains after all taxes and OAS recovery tax are deducted from gross income{isCouple ? ". The per-partner split shows each person's contribution to household income" : ""}.</Explanation>
+      </div>
+
+      {/* Chart 4: Tax Impact */}
+      <div className="bg-slate-800/30 border border-slate-700/30 rounded-xl p-5 mb-8">
+        <h3 className="text-sm font-semibold text-white mb-1">Tax & OAS Clawback</h3>
+        <p className="text-xs text-slate-400 mb-4">Annual combined federal + provincial taxes{hasEmployment ? " (including on employment income)" : ""} and any OAS recovery tax{isCouple && chartView === "combined" ? ", broken down per partner" : ""}</p>
+        <ResponsiveContainer width="100%" height={300}>
+          <BarChart data={retData}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+            <XAxis {...xAxisProps} />
+            <YAxis tickFormatter={fmtK} tick={{ fill: "#94a3b8", fontSize: 11 }} />
+            <Tooltip content={<CustomTooltip />} />
+            <Legend wrapperStyle={{ fontSize: 12 }} />
+            {isCouple && chartView === "combined" ? (
+              <>
+                <Bar dataKey="youTax" name={`${names.youName} Tax`} stackId="1" fill="#dc2626" />
+                <Bar dataKey="youClawback" name={`${names.youName} Clawback`} stackId="1" fill="#f97316" />
+                <Bar dataKey="partnerTax" name={`${names.partnerName} Tax`} stackId="1" fill="#991b1b" />
+                <Bar dataKey="partnerClawback" name={`${names.partnerName} Clawback`} stackId="1" fill="#c2410c" />
+              </>
+            ) : (
+              <>
+                <Bar dataKey="tax" name="Fed + Prov Tax" stackId="1" fill="#dc2626" />
+                <Bar dataKey="clawback" name="OAS Clawback" stackId="1" fill="#f97316" />
+              </>
+            )}
           </BarChart>
         </ResponsiveContainer>
         <Explanation>The withdrawal strategy keeps your taxable income below the OAS clawback threshold ({fmt(inputs.oasClawbackThreshold)} in today's dollars), preserving your full OAS benefit. Without optimization, high-income retirees can lose thousands per year to clawback.</Explanation>
