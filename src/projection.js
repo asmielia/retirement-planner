@@ -126,19 +126,37 @@ export function runProjection(inputs, strategy = "optimize") {
       savWd = Math.min(savAvailAfterFloor, portfolioNeed);
       let rem = portfolioNeed - savWd;
 
-      // Step 2: RRSP — fill low tax brackets up to OAS clawback threshold
       const lockedIncome = cpp + oasGross + pension + bridge + other;
-      const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
-      rrspWd = Math.min(rrspAvail, rem, rrspRoom);
-      rem -= rrspWd;
+      const receivingOas = oasGross > 0;
 
-      // Step 3: Non-registered (50% capital gains inclusion — moderate tax cost)
-      nrWd = Math.min(nonRegAvail, rem);
-      rem -= nrWd;
+      if (receivingOas) {
+        // ── OAS-aware order: RRSP (capped) → Non-reg → TFSA ──
+        // Cap RRSP at OAS clawback threshold to minimize clawback
+        const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+        rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+        rem -= rrspWd;
 
-      // Step 4: TFSA last (preserve tax-free compounding)
-      tfsaWd = Math.min(tfsaAvail, rem);
-      rem -= tfsaWd;
+        // Step 3: Non-registered (50% capital gains inclusion)
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        // Step 4: TFSA last (preserve tax-free compounding)
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
+      } else {
+        // ── Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA ──
+        // No OAS clawback risk, so draw down RRSP freely and preserve TFSA
+        rrspWd = Math.min(rrspAvail, rem);
+        rem -= rrspWd;
+
+        // Non-registered next
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        // TFSA only if still short
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
+      }
 
       // Step 5: If still short, dip into the cash floor as a last resort
       if (rem > 0) {
@@ -147,9 +165,8 @@ export function runProjection(inputs, strategy = "optimize") {
         rem -= extraSav;
       }
 
-      // Step 6: If still short, pull more RRSP beyond OAS cap.
+      // Step 6: If still short (OAS mode cap), pull more RRSP beyond OAS cap.
       // Meeting spending needs is more important than avoiding OAS clawback.
-      // This also covers pre-OAS ages (55-64) where the cap was unnecessarily limiting.
       if (rem > 0) {
         const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
         rrspWd += extraRrsp;
