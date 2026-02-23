@@ -42,6 +42,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
   const rows = [];
   let yRrsp = you.rrspBal, yTfsa = you.tfsaBal, yNonReg = you.nonRegBal, ySav = you.savingsBal;
   let pRrsp = partner.rrspBal, pTfsa = partner.tfsaBal, pNonReg = partner.nonRegBal, pSav = partner.savingsBal;
+  let yTfsaRoom = 0, pTfsaRoom = 0; // TFSA contribution room starts at 0 today
 
   for (let year = 1; year <= totalYears; year++) {
     const youAge = you.currentAge + (year - 1);
@@ -142,6 +143,13 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         rem -= extraSav;
       }
 
+      // If still short (spend_down can exceed OAS cap), pull more RRSP
+      if (rem > 0 && strategy === "spend_down") {
+        const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
+        rrspWd += extraRrsp;
+        rem -= extraRrsp;
+      }
+
       // RRSP top-up
       if (strategy === "optimize" || strategy === "max_estate") {
         const yearsToEnd = person.lifeExpectancy - (person === you ? youAge : partnerAge);
@@ -214,15 +222,22 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       }
     }
 
-    // Update balances — RRSP top-up excess goes to TFSA (tax-optimal rebalance)
+    // Update balances — RRSP top-up excess goes to TFSA (up to contribution room), overflow to non-reg
+    // TFSA contribution room: $7K/year per person accrues, withdrawals restore room
     if (youAlive) {
+      yTfsaRoom += 7000;
       if (youRetired) {
+        yTfsaRoom += yTfsaWd; // withdrawals restore contribution room
         const yExtraFromTopUp = Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0));
+        const yToTfsa = Math.min(yExtraFromTopUp, yTfsaRoom);
+        const yToNonReg = yExtraFromTopUp - yToTfsa;
+        yTfsaRoom -= yToTfsa;
         yRrsp = Math.max(0, yRrspAvail - yRrspWd);
-        yTfsa = Math.max(0, yTfsaAvail - yTfsaWd) + yExtraFromTopUp;
-        yNonReg = Math.max(0, yNonRegAvail - yNrWd);
+        yTfsa = Math.max(0, yTfsaAvail - yTfsaWd) + yToTfsa;
+        yNonReg = Math.max(0, yNonRegAvail - yNrWd) + yToNonReg;
         ySav = Math.max(0, ySavAvail - ySavWd);
       } else {
+        yTfsaRoom -= you.tfsaContrib; // pre-retirement contributions use room
         yRrsp = yRrsp * (1 + inputs.preGrowth) + you.rrspContrib;
         yTfsa = yTfsa * (1 + inputs.preGrowth) + you.tfsaContrib;
         yNonReg = yNonReg * (1 + inputs.preGrowth) + you.nonRegContrib;
@@ -230,13 +245,19 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       }
     }
     if (partnerAlive) {
+      pTfsaRoom += 7000;
       if (partnerRetired) {
+        pTfsaRoom += pTfsaWd; // withdrawals restore contribution room
         const pExtraFromTopUp = Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0));
+        const pToTfsa = Math.min(pExtraFromTopUp, pTfsaRoom);
+        const pToNonReg = pExtraFromTopUp - pToTfsa;
+        pTfsaRoom -= pToTfsa;
         pRrsp = Math.max(0, pRrspAvail - pRrspWd);
-        pTfsa = Math.max(0, pTfsaAvail - pTfsaWd) + pExtraFromTopUp;
-        pNonReg = Math.max(0, pNonRegAvail - pNrWd);
+        pTfsa = Math.max(0, pTfsaAvail - pTfsaWd) + pToTfsa;
+        pNonReg = Math.max(0, pNonRegAvail - pNrWd) + pToNonReg;
         pSav = Math.max(0, pSavAvail - pSavWd);
       } else {
+        pTfsaRoom -= partner.tfsaContrib; // pre-retirement contributions use room
         pRrsp = pRrsp * (1 + inputs.preGrowth) + partner.rrspContrib;
         pTfsa = pTfsa * (1 + inputs.preGrowth) + partner.tfsaContrib;
         pNonReg = pNonReg * (1 + inputs.preGrowth) + partner.nonRegContrib;
@@ -278,8 +299,13 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const totalTax = yTax.totalTax + pTax.totalTax;
     const totalClawback = yTax.oasClawback + pTax.oasClawback;
 
+    // Track RRSP→TFSA rebalance per partner (not spendable income)
+    const yTransfer = youRetired ? Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0)) : 0;
+    const pTransfer = partnerRetired ? Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0)) : 0;
+    const totalTransfer = yTransfer + pTransfer;
+
     const combinedWd = ySavWd + yNrWd + yRrspWd + yTfsaWd + pSavWd + pNrWd + pRrspWd + pTfsaWd;
-    const netIncome = combinedWd + combinedFixed - totalTax - totalClawback;
+    const netIncome = combinedWd + combinedFixed - totalTax - totalClawback - totalTransfer;
 
     rows.push({
       year, age: yearAge, youAge, partnerAge, phase,
@@ -292,6 +318,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       other: youFixed.other + partnerFixed.other,
       employment: youFixed.employment + partnerFixed.employment,
       savWd: ySavWd + pSavWd, nrWd: yNrWd + pNrWd, rrspWd: yRrspWd + pRrspWd, tfsaWd: yTfsaWd + pTfsaWd,
+      rrspToTfsaTransfer: totalTransfer,
       taxableIncome: yTax.taxableIncome + pTax.taxableIncome,
       totalTax, oasClawback: totalClawback, netIncome,
       desiredNominal,
@@ -301,15 +328,15 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         rrsp: yRrsp, tfsa: yTfsa, nonReg: yNonReg, savings: ySav, totalPortfolio: yPortfolio,
         cpp: youFixed.cpp, oasGross: youFixed.oasGross, pension: youFixed.pension, bridge: youFixed.bridge, other: youFixed.other,
         employment: youFixed.employment,
-        savWd: ySavWd, nrWd: yNrWd, rrspWd: yRrspWd, tfsaWd: yTfsaWd,
-        ...yTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - yTax.totalTax - yTax.oasClawback,
+        savWd: ySavWd, nrWd: yNrWd, rrspWd: yRrspWd, tfsaWd: yTfsaWd, rrspToTfsaTransfer: yTransfer,
+        ...yTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - yTax.totalTax - yTax.oasClawback - yTransfer,
       },
       partner: {
         rrsp: pRrsp, tfsa: pTfsa, nonReg: pNonReg, savings: pSav, totalPortfolio: pPortfolio,
         cpp: partnerFixed.cpp, oasGross: partnerFixed.oasGross, pension: partnerFixed.pension, bridge: partnerFixed.bridge, other: partnerFixed.other,
         employment: partnerFixed.employment,
-        savWd: pSavWd, nrWd: pNrWd, rrspWd: pRrspWd, tfsaWd: pTfsaWd,
-        ...pTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - pTax.totalTax - pTax.oasClawback,
+        savWd: pSavWd, nrWd: pNrWd, rrspWd: pRrspWd, tfsaWd: pTfsaWd, rrspToTfsaTransfer: pTransfer,
+        ...pTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - pTax.totalTax - pTax.oasClawback - pTransfer,
       },
     });
   }

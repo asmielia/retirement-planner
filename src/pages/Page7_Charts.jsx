@@ -23,13 +23,15 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
     const displayAge = isCouple
       ? chartView === "you" ? r.youAge : chartView === "partner" ? r.partnerAge : r.age
       : r.age;
+    // Subtract RRSP→TFSA rebalance from rrspWd so gross income chart shows only the spending portion
+    const transfer = src.rrspToTfsaTransfer ?? r.rrspToTfsaTransfer ?? 0;
     return {
       age: displayAge, youAge: r.youAge, partnerAge: r.partnerAge,
       portfolio, real: chartView === "combined" || !isCouple ? r.realPortfolio : portfolio / infFactor,
       rrsp: src.rrsp, tfsa: src.tfsa, nonReg: src.nonReg, savings: src.savings,
       cpp: src.cpp, oas: src.oasGross, pension: src.pension, bridge: src.bridge, other: src.other,
       employment: src.employment ?? r.employment ?? 0,
-      savWd: src.savWd, nrWd: src.nrWd, rrspWd: src.rrspWd, tfsaWd: src.tfsaWd,
+      savWd: src.savWd, nrWd: src.nrWd, rrspWd: Math.max(0, src.rrspWd - transfer), tfsaWd: src.tfsaWd,
       tax: src.totalTax ?? r.totalTax, clawback: src.oasClawback ?? r.oasClawback, net: src.netIncome ?? r.netIncome, desired: r.desiredNominal,
       // Per-partner breakdowns for couple mode
       youTax: r.you?.totalTax ?? 0, youClawback: r.you?.oasClawback ?? 0, youNet: r.you?.netIncome ?? 0,
@@ -284,6 +286,7 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
               }).map(r => {
                 const s = isCouple && chartView === "you" ? r.you : isCouple && chartView === "partner" ? r.partner : r;
                 const dispAge = isCouple && chartView === "you" ? r.youAge : isCouple && chartView === "partner" ? r.partnerAge : r.age;
+                const xfer = s.rrspToTfsaTransfer ?? r.rrspToTfsaTransfer ?? 0;
                 return (
                   <tr key={r.age} className="border-b border-slate-800/50 hover:bg-slate-700/20">
                     {isCouple && chartView === "combined" ? (
@@ -297,7 +300,7 @@ export default function Page7_Charts({ inputs, results, surplusMode, setSurplusM
                       ...(inputs.pensionBridge > 0 && inputs.retirementAge < 65 ? [s.bridge] : []),
                       ...((isCouple ? Math.max(inputs.otherIncome, inputs.partner.otherIncome) : inputs.otherIncome) > 0 ? [s.other] : []),
                       ...(hasEmployment ? [s.employment ?? r.employment ?? 0] : []),
-                      s.savWd, s.nrWd, s.rrspWd, s.tfsaWd,
+                      s.savWd, s.nrWd, Math.max(0, s.rrspWd - xfer), s.tfsaWd,
                       s.taxableIncome ?? r.taxableIncome, s.totalTax ?? r.totalTax, s.oasClawback ?? r.oasClawback, s.netIncome ?? r.netIncome].map((v,i) => (
                       <td key={i} className="px-2 py-1.5 text-right text-slate-300">{fmtK(v)}</td>
                     ))}
