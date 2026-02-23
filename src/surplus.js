@@ -61,11 +61,12 @@ export function runRetireEarly(inputs) {
   for (let i = 0; i < 20; i++) {
     const mid = Math.round((lo + hi) / 2);
     if (mid === hi) break;
-    const result = runProjection({ ...inputs, retirementAge: mid });
+    // Pass originalRetirementAge so pension/bridge only start at the originally planned age
+    const result = runProjection({ ...inputs, retirementAge: mid, originalRetirementAge: inputs.retirementAge });
     const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
     if (endBal > 0) hi = mid; else lo = mid + 1;
   }
-  const finalResult = runProjection({ ...inputs, retirementAge: hi });
+  const finalResult = runProjection({ ...inputs, retirementAge: hi, originalRetirementAge: inputs.retirementAge });
   return {
     ...finalResult,
     surplusMode: "retire_early",

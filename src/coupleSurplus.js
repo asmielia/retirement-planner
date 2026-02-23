@@ -65,7 +65,11 @@ export function runCoupleRetireEarly(inputs) {
   let partnerRetAge = inputs.partner.retirementAge;
 
   function isFunded(yAge, pAge) {
-    const test = { ...inputs, retirementAge: yAge, partner: { ...inputs.partner, retirementAge: pAge } };
+    // Pass originalRetirementAge so pension/bridge only start at originally planned age
+    const test = {
+      ...inputs, retirementAge: yAge, originalRetirementAge: inputs.retirementAge,
+      partner: { ...inputs.partner, retirementAge: pAge, originalRetirementAge: inputs.partner.retirementAge },
+    };
     const r = runCoupleProjection(test);
     return (r.rows[r.rows.length - 1]?.totalPortfolio ?? 0) > 0;
   }
@@ -106,7 +110,10 @@ export function runCoupleRetireEarly(inputs) {
     partnerRetAge -= lo;
   }
 
-  const earlyInputs = { ...inputs, retirementAge: youRetAge, partner: { ...inputs.partner, retirementAge: partnerRetAge } };
+  const earlyInputs = {
+    ...inputs, retirementAge: youRetAge, originalRetirementAge: inputs.retirementAge,
+    partner: { ...inputs.partner, retirementAge: partnerRetAge, originalRetirementAge: inputs.partner.retirementAge },
+  };
   const finalResult = runCoupleProjection(earlyInputs);
   return {
     ...finalResult,

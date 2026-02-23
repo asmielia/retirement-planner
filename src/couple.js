@@ -8,6 +8,7 @@ export function buildPersonInputs(inputs, who) {
   const p = who === "partner" ? inputs.partner : inputs;
   return {
     currentAge: p.currentAge, retirementAge: p.retirementAge, lifeExpectancy: p.lifeExpectancy,
+    originalRetirementAge: p.originalRetirementAge || p.retirementAge,
     employmentIncome: p.employmentIncome || 0,
     rrspBal: p.rrspBal, tfsaBal: p.tfsaBal, nonRegBal: p.nonRegBal, savingsBal: p.savingsBal,
     rrspContrib: p.rrspContrib, tfsaContrib: p.tfsaContrib, nonRegContrib: p.nonRegContrib, savingsContrib: p.savingsContrib,
@@ -43,6 +44,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
   let yRrsp = you.rrspBal, yTfsa = you.tfsaBal, yNonReg = you.nonRegBal, ySav = you.savingsBal;
   let pRrsp = partner.rrspBal, pTfsa = partner.tfsaBal, pNonReg = partner.nonRegBal, pSav = partner.savingsBal;
   let yTfsaRoom = 0, pTfsaRoom = 0; // TFSA contribution room starts at 0 today
+  let yNonRegCostBasis = you.nonRegBal, pNonRegCostBasis = partner.nonRegBal;
 
   for (let year = 1; year <= totalYears; year++) {
     const youAge = you.currentAge + (year - 1);
@@ -79,8 +81,10 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
 
       const cpp = pAge >= optCpp.age ? optCpp.annual * infFactor : 0;
       const oasGross = pAge >= optOas.age ? optOas.annual * infFactor : 0;
-      const pension = pRetired ? p.pensionIncome : 0;
-      const bridge = (pRetired && pAge < 65) ? p.pensionBridge : 0;
+      // Pension starts at age 65 (DB pension benefit age).
+      // Bridge covers gap from originally planned retirement age to 65.
+      const pension = pAge >= 65 ? p.pensionIncome : 0;
+      const bridge = (pAge >= p.originalRetirementAge && pAge < 65) ? p.pensionBridge : 0;
       const other = pRetired ? p.otherIncome * infFactor : 0;
       const employment = !pRetired ? (p.employmentIncome || 0) * infFactor : 0;
 
@@ -222,6 +226,12 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       }
     }
 
+    // Compute non-reg capital gain fractions BEFORE updating cost basis
+    const yNrGainFrac = yNonRegAvail > 0 ? Math.max(0, 1 - yNonRegCostBasis / yNonRegAvail) : 0;
+    const pNrGainFrac = pNonRegAvail > 0 ? Math.max(0, 1 - pNonRegCostBasis / pNonRegAvail) : 0;
+    const yNrTaxableGain = yNrWd * yNrGainFrac * 0.5;
+    const pNrTaxableGain = pNrWd * pNrGainFrac * 0.5;
+
     // Update balances — RRSP top-up excess goes to TFSA (up to contribution room), overflow to non-reg
     // TFSA contribution room: $7K/year per person accrues, withdrawals restore room
     if (youAlive) {
@@ -236,11 +246,18 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         yTfsa = Math.max(0, yTfsaAvail - yTfsaWd) + yToTfsa;
         yNonReg = Math.max(0, yNonRegAvail - yNrWd) + yToNonReg;
         ySav = Math.max(0, ySavAvail - ySavWd);
+        // Update cost basis: reduce proportionally on withdrawal, increase by top-up overflow
+        if (yNonRegAvail > 0 && yNrWd > 0) {
+          yNonRegCostBasis = yNonRegCostBasis * (1 - yNrWd / yNonRegAvail) + yToNonReg;
+        } else {
+          yNonRegCostBasis += yToNonReg;
+        }
       } else {
         yTfsaRoom -= you.tfsaContrib; // pre-retirement contributions use room
         yRrsp = yRrsp * (1 + inputs.preGrowth) + you.rrspContrib;
         yTfsa = yTfsa * (1 + inputs.preGrowth) + you.tfsaContrib;
         yNonReg = yNonReg * (1 + inputs.preGrowth) + you.nonRegContrib;
+        yNonRegCostBasis += you.nonRegContrib;
         ySav = ySav + you.savingsContrib;
       }
     }
@@ -256,11 +273,18 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         pTfsa = Math.max(0, pTfsaAvail - pTfsaWd) + pToTfsa;
         pNonReg = Math.max(0, pNonRegAvail - pNrWd) + pToNonReg;
         pSav = Math.max(0, pSavAvail - pSavWd);
+        // Update cost basis: reduce proportionally on withdrawal, increase by top-up overflow
+        if (pNonRegAvail > 0 && pNrWd > 0) {
+          pNonRegCostBasis = pNonRegCostBasis * (1 - pNrWd / pNonRegAvail) + pToNonReg;
+        } else {
+          pNonRegCostBasis += pToNonReg;
+        }
       } else {
         pTfsaRoom -= partner.tfsaContrib; // pre-retirement contributions use room
         pRrsp = pRrsp * (1 + inputs.preGrowth) + partner.rrspContrib;
         pTfsa = pTfsa * (1 + inputs.preGrowth) + partner.tfsaContrib;
         pNonReg = pNonReg * (1 + inputs.preGrowth) + partner.nonRegContrib;
+        pNonRegCostBasis += partner.nonRegContrib;
         pSav = pSav + partner.savingsContrib;
       }
     }
@@ -269,14 +293,20 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const pPortfolio = pRrsp + pTfsa + pNonReg + pSav;
     const totalPortfolio = yPortfolio + pPortfolio;
 
-    // Tax per person
+    // Track RRSP→TFSA rebalance per partner (not spendable income) — compute BEFORE tax
+    const yTransfer = youRetired ? Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0)) : 0;
+    const pTransfer = partnerRetired ? Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0)) : 0;
+    const totalTransfer = yTransfer + pTransfer;
+
+    // Tax per person — computed on full RRSP withdrawal (including top-up rebalance),
+    // because the top-up IS real taxable income that the user pays tax on.
     const fedBpa = fedBrk.bpa * infFactor;
     const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
     const provBpa = provData.bpa * infFactor;
     const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
 
-    function computeTax(rrspWd, cpp, oasGross, pension, bridge, other, nonRegAvail, oasClawbackThreshold) {
-      const taxableIncome = rrspWd + cpp + oasGross + pension + bridge + other + Math.max(0, nonRegAvail * inputs.postGrowth * 0.5);
+    function computeTax(rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain, oasClawbackThreshold) {
+      const taxableIncome = rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain;
       const fedTax = calcProgressiveTax(taxableIncome, fedBpa, fedBrackets);
       const provTax = calcProgressiveTax(taxableIncome, provBpa, provBrackets);
       const totalTax = fedTax + provTax;
@@ -286,12 +316,12 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     }
 
     const yTax = youRetired
-      ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNonRegAvail, you.oasClawbackThreshold)
+      ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNrTaxableGain, you.oasClawbackThreshold)
       : youAlive && youFixed.employment > 0
         ? (() => { const ti = youFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
         : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
     const pTax = partnerRetired
-      ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNonRegAvail, partner.oasClawbackThreshold)
+      ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNrTaxableGain, partner.oasClawbackThreshold)
       : partnerAlive && partnerFixed.employment > 0
         ? (() => { const ti = partnerFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
         : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
@@ -299,13 +329,11 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const totalTax = yTax.totalTax + pTax.totalTax;
     const totalClawback = yTax.oasClawback + pTax.oasClawback;
 
-    // Track RRSP→TFSA rebalance per partner (not spendable income)
-    const yTransfer = youRetired ? Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0)) : 0;
-    const pTransfer = partnerRetired ? Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0)) : 0;
-    const totalTransfer = yTransfer + pTransfer;
-
-    const combinedWd = ySavWd + yNrWd + yRrspWd + yTfsaWd + pSavWd + pNrWd + pRrspWd + pTfsaWd;
-    const netIncome = combinedWd + combinedFixed - totalTax - totalClawback - totalTransfer;
+    // Net income: total withdrawals + fixed income - tax - clawback - RRSP top-up transfer
+    // (transfer went to TFSA/non-reg and is not spendable cash)
+    const yTotalWd = ySavWd + yNrWd + yRrspWd + yTfsaWd;
+    const pTotalWd = pSavWd + pNrWd + pRrspWd + pTfsaWd;
+    const netIncome = yTotalWd + pTotalWd + combinedFixed - totalTax - totalClawback - totalTransfer;
 
     rows.push({
       year, age: yearAge, youAge, partnerAge, phase,
