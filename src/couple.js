@@ -123,7 +123,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     let ySavWd = 0, yNrWd = 0, yRrspWd = 0, yTfsaWd = 0;
     let pSavWd = 0, pNrWd = 0, pRrspWd = 0, pTfsaWd = 0;
 
-    function allocateWithdrawals(need, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, person, alive, retired) {
+    function allocateWithdrawals(need, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, oasGross, person, alive, retired) {
       if (!alive || !retired || need <= 0) return { savWd: 0, nrWd: 0, rrspWd: 0, tfsaWd: 0 };
 
       const cashFloor = strategy === "spend_down" ? 0 : (desiredNominal / 12) * 2 * (need / Math.max(1, portfolioNeed));
@@ -131,15 +131,31 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       let savWd = Math.min(savAvailAfterFloor, need);
       let rem = need - savWd;
 
-      const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
-      let rrspWd = Math.min(rrspAvail, rem, rrspRoom);
-      rem -= rrspWd;
+      const receivingOas = oasGross > 0;
+      let rrspWd, nrWd, tfsaWd;
 
-      let nrWd = Math.min(nonRegAvail, rem);
-      rem -= nrWd;
+      if (receivingOas) {
+        // OAS-aware order: RRSP (capped) → Non-reg → TFSA
+        const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+        rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+        rem -= rrspWd;
 
-      let tfsaWd = Math.min(tfsaAvail, rem);
-      rem -= tfsaWd;
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
+      } else {
+        // Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA
+        rrspWd = Math.min(rrspAvail, rem);
+        rem -= rrspWd;
+
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
+      }
 
       if (rem > 0) {
         const extraSav = Math.min(savAvail - savWd, rem);
@@ -147,9 +163,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         rem -= extraSav;
       }
 
-      // If still short, pull more RRSP beyond OAS cap.
-      // Meeting spending needs is more important than avoiding OAS clawback.
-      // This also covers pre-OAS ages where the cap was unnecessarily limiting.
+      // If still short (OAS mode cap), pull more RRSP beyond OAS cap.
       if (rem > 0) {
         const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
         rrspWd += extraRrsp;
@@ -210,20 +224,20 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
         const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
 
-        const yWd = allocateWithdrawals(youShare, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, you, youAlive, youRetired);
-        const pWd = allocateWithdrawals(partnerShare, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partner, partnerAlive, partnerRetired);
+        const yWd = allocateWithdrawals(youShare, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, you, youAlive, youRetired);
+        const pWd = allocateWithdrawals(partnerShare, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partner, partnerAlive, partnerRetired);
 
         ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
         pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
       } else if (youCanWithdraw) {
         const yOasThresh = you.oasClawbackThreshold * infFactor;
         const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
-        const yWd = allocateWithdrawals(portfolioNeed, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, you, youAlive, youRetired);
+        const yWd = allocateWithdrawals(portfolioNeed, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, you, youAlive, youRetired);
         ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
       } else if (partnerCanWithdraw) {
         const pOasThresh = partner.oasClawbackThreshold * infFactor;
         const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
-        const pWd = allocateWithdrawals(portfolioNeed, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partner, partnerAlive, partnerRetired);
+        const pWd = allocateWithdrawals(portfolioNeed, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partner, partnerAlive, partnerRetired);
         pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
       }
     }
