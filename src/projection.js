@@ -180,11 +180,14 @@ export function runProjection(inputs, strategy = "optimize") {
 
     // Update balances
     if (isRetired) {
-      const extraCash = Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed);
+      // RRSP top-up excess (withdrawn beyond spending need) goes to TFSA, not cash.
+      // The money has already been taxed at withdrawal, so sheltering future growth
+      // in TFSA avoids further taxation — this is the tax-optimal rebalance.
+      const extraFromTopUp = Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed);
       rrsp = Math.max(0, rrspAvail - rrspWd);
-      tfsa = Math.max(0, tfsaAvail - tfsaWd);
+      tfsa = Math.max(0, tfsaAvail - tfsaWd) + extraFromTopUp;
       nonReg = Math.max(0, nonRegAvail - nrWd);
-      savings = Math.max(0, savAvail - savWd + extraCash);
+      savings = Math.max(0, savAvail - savWd);
     } else {
       rrsp = rrsp * (1 + preGrowth) + rrspContrib;
       tfsa = tfsa * (1 + preGrowth) + tfsaContrib;

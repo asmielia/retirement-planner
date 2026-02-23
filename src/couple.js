@@ -214,14 +214,14 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       }
     }
 
-    // Update balances
+    // Update balances — RRSP top-up excess goes to TFSA (tax-optimal rebalance)
     if (youAlive) {
       if (youRetired) {
-        const yExtraCash = Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0));
+        const yExtraFromTopUp = Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0));
         yRrsp = Math.max(0, yRrspAvail - yRrspWd);
-        yTfsa = Math.max(0, yTfsaAvail - yTfsaWd);
+        yTfsa = Math.max(0, yTfsaAvail - yTfsaWd) + yExtraFromTopUp;
         yNonReg = Math.max(0, yNonRegAvail - yNrWd);
-        ySav = Math.max(0, ySavAvail - ySavWd + yExtraCash);
+        ySav = Math.max(0, ySavAvail - ySavWd);
       } else {
         yRrsp = yRrsp * (1 + inputs.preGrowth) + you.rrspContrib;
         yTfsa = yTfsa * (1 + inputs.preGrowth) + you.tfsaContrib;
@@ -231,11 +231,11 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     }
     if (partnerAlive) {
       if (partnerRetired) {
-        const pExtraCash = Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0));
+        const pExtraFromTopUp = Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0));
         pRrsp = Math.max(0, pRrspAvail - pRrspWd);
-        pTfsa = Math.max(0, pTfsaAvail - pTfsaWd);
+        pTfsa = Math.max(0, pTfsaAvail - pTfsaWd) + pExtraFromTopUp;
         pNonReg = Math.max(0, pNonRegAvail - pNrWd);
-        pSav = Math.max(0, pSavAvail - pSavWd + pExtraCash);
+        pSav = Math.max(0, pSavAvail - pSavWd);
       } else {
         pRrsp = pRrsp * (1 + inputs.preGrowth) + partner.rrspContrib;
         pTfsa = pTfsa * (1 + inputs.preGrowth) + partner.tfsaContrib;
