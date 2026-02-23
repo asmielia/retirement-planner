@@ -65,6 +65,7 @@ export function runProjection(inputs, strategy = "optimize") {
   // Year-by-year projection
   const rows = [];
   let rrsp = rrspBal, tfsa = tfsaBal, nonReg = nonRegBal, savings = savingsBal;
+  let tfsaRoom = 0; // TFSA contribution room starts at 0 today
 
   for (let year = 1; year <= (lifeExpectancy - currentAge + 1); year++) {
     const age = currentAge + year - 1;
@@ -140,6 +141,13 @@ export function runProjection(inputs, strategy = "optimize") {
         rem -= extraSav;
       }
 
+      // Step 6: If still short (spend_down can exceed OAS cap), pull more RRSP
+      if (rem > 0 && strategy === "spend_down") {
+        const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
+        rrspWd += extraRrsp;
+        rem -= extraRrsp;
+      }
+
       // ── RRSP top-up: draw extra RRSP if current marginal rate < terminal rate ──
       if (strategy === "optimize" || strategy === "max_estate") {
         const yearsToEnd = lifeExpectancy - age;
@@ -179,16 +187,24 @@ export function runProjection(inputs, strategy = "optimize") {
     }
 
     // Update balances
+    // TFSA contribution room: $7K/year accrues, withdrawals restore room
+    tfsaRoom += 7000;
     if (isRetired) {
-      // RRSP top-up excess (withdrawn beyond spending need) goes to TFSA, not cash.
-      // The money has already been taxed at withdrawal, so sheltering future growth
-      // in TFSA avoids further taxation — this is the tax-optimal rebalance.
+      tfsaRoom += tfsaWd; // withdrawals restore contribution room
+
+      // RRSP top-up excess (withdrawn beyond spending need) goes to TFSA up to
+      // available contribution room. Any overflow goes to non-registered.
       const extraFromTopUp = Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed);
+      const toTfsa = Math.min(extraFromTopUp, tfsaRoom);
+      const toNonReg = extraFromTopUp - toTfsa;
+      tfsaRoom -= toTfsa;
+
       rrsp = Math.max(0, rrspAvail - rrspWd);
-      tfsa = Math.max(0, tfsaAvail - tfsaWd) + extraFromTopUp;
-      nonReg = Math.max(0, nonRegAvail - nrWd);
+      tfsa = Math.max(0, tfsaAvail - tfsaWd) + toTfsa;
+      nonReg = Math.max(0, nonRegAvail - nrWd) + toNonReg;
       savings = Math.max(0, savAvail - savWd);
     } else {
+      tfsaRoom -= tfsaContrib; // pre-retirement contributions use room
       rrsp = rrsp * (1 + preGrowth) + rrspContrib;
       tfsa = tfsa * (1 + preGrowth) + tfsaContrib;
       nonReg = nonReg * (1 + preGrowth) + nonRegContrib;
@@ -197,7 +213,11 @@ export function runProjection(inputs, strategy = "optimize") {
 
     const totalPortfolio = rrsp + tfsa + nonReg + savings;
 
-    // Taxable income
+    // The RRSP top-up excess is an internal RRSP→TFSA rebalance, not spendable income.
+    // Track it so charts can show only the spending portion of withdrawals.
+    const rrspToTfsaTransfer = isRetired ? Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed) : 0;
+
+    // Taxable income (tax is computed on the full RRSP withdrawal including top-up)
     const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + Math.max(0, nonRegAvail * postGrowth * 0.5) : 0;
 
     // Tax calculation
@@ -208,14 +228,14 @@ export function runProjection(inputs, strategy = "optimize") {
     // OAS clawback
     const oasClawback = isRetired ? Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15)) : 0;
 
-    // Net income
-    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback : 0;
+    // Net income — excludes the RRSP→TFSA rebalance since it's not spendable
+    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback - rrspToTfsaTransfer : 0;
 
     rows.push({
       year, age, phase, rrsp, tfsa, nonReg, savings,
       cpp, oasGross, pension, bridge, other, totalPortfolio,
       contribution: isRetired ? 0 : rrspContrib + tfsaContrib + nonRegContrib + savingsContrib,
-      desiredNominal, savWd, nrWd, rrspWd, tfsaWd,
+      desiredNominal, savWd, nrWd, rrspWd, tfsaWd, rrspToTfsaTransfer,
       taxableIncome, totalTax, oasClawback, netIncome,
       realPortfolio: totalPortfolio / infFactor,
     });
