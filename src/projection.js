@@ -147,8 +147,10 @@ export function runProjection(inputs, strategy = "optimize") {
         rem -= extraSav;
       }
 
-      // Step 6: If still short (spend_down can exceed OAS cap), pull more RRSP
-      if (rem > 0 && strategy === "spend_down") {
+      // Step 6: If still short, pull more RRSP beyond OAS cap.
+      // Meeting spending needs is more important than avoiding OAS clawback.
+      // This also covers pre-OAS ages (55-64) where the cap was unnecessarily limiting.
+      if (rem > 0) {
         const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
         rrspWd += extraRrsp;
         rem -= extraRrsp;
