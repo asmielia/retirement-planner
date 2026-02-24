@@ -62,11 +62,12 @@ export function runRetireEarly(inputs) {
     const mid = Math.round((lo + hi) / 2);
     if (mid === hi) break;
     // Pass originalRetirementAge so pension/bridge only start at the originally planned age
-    const result = runProjection({ ...inputs, retirementAge: mid, originalRetirementAge: inputs.retirementAge });
+    // Use spend_down strategy so RRSP top-up doesn't preserve portfolio artificially
+    const result = runProjection({ ...inputs, retirementAge: mid, originalRetirementAge: inputs.retirementAge }, "spend_down");
     const endBal = result.rows[result.rows.length - 1]?.totalPortfolio ?? 0;
     if (endBal > 0) hi = mid; else lo = mid + 1;
   }
-  const finalResult = runProjection({ ...inputs, retirementAge: hi, originalRetirementAge: inputs.retirementAge });
+  const finalResult = runProjection({ ...inputs, retirementAge: hi, originalRetirementAge: inputs.retirementAge }, "spend_down");
   return {
     ...finalResult,
     surplusMode: "retire_early",

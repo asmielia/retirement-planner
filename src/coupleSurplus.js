@@ -66,11 +66,12 @@ export function runCoupleRetireEarly(inputs) {
 
   function isFunded(yAge, pAge) {
     // Pass originalRetirementAge so pension/bridge only start at originally planned age
+    // Use spend_down strategy so RRSP top-up doesn't preserve portfolio artificially
     const test = {
       ...inputs, retirementAge: yAge, originalRetirementAge: inputs.retirementAge,
       partner: { ...inputs.partner, retirementAge: pAge, originalRetirementAge: inputs.partner.retirementAge },
     };
-    const r = runCoupleProjection(test);
+    const r = runCoupleProjection(test, "spend_down");
     return (r.rows[r.rows.length - 1]?.totalPortfolio ?? 0) > 0;
   }
 
@@ -114,7 +115,7 @@ export function runCoupleRetireEarly(inputs) {
     ...inputs, retirementAge: youRetAge, originalRetirementAge: inputs.retirementAge,
     partner: { ...inputs.partner, retirementAge: partnerRetAge, originalRetirementAge: inputs.partner.retirementAge },
   };
-  const finalResult = runCoupleProjection(earlyInputs);
+  const finalResult = runCoupleProjection(earlyInputs, "spend_down");
   return {
     ...finalResult,
     surplusMode: "retire_early",
