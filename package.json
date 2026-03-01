@@ -6,11 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "vitest run && vite build",
-    "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "preview": "vite preview"
   },
   "dependencies": {
+    "lz-string": "^1.5.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^2.12.0"

@@ -1,45 +1,47 @@
-// ═══════════════════════════════════════════════
-// PROVINCE TAX DATA
-// ═══════════════════════════════════════════════
-export const PROVINCES = {
-  Ontario:        { bpa:11865, brackets:[[53891,.0505],[107785,.0915],[150000,.1116],[220000,.1216],[Infinity,.1316]] },
-  "British Columbia": { bpa:12932, brackets:[[47937,.0506],[95875,.077],[110076,.105],[133664,.1229],[Infinity,.205]] },
-  Alberta:        { bpa:22769, brackets:[[61200,.1],[122399,.12],[163258,.13],[245087,.14],[Infinity,.15]] },
-  Saskatchewan:   { bpa:20381, brackets:[[54532,.105],[155805,.125],[Infinity,.145],[Infinity,.145],[Infinity,.145]] },
-  Manitoba:       { bpa:15780, brackets:[[47000,.108],[100000,.1275],[200000,.174],[Infinity,.205],[Infinity,.205]] },
-  Quebec:         { bpa:18056, brackets:[[54345,.14],[108680,.19],[132245,.24],[Infinity,.2575],[Infinity,.2575]] },
-  "New Brunswick":{ bpa:13396, brackets:[[52333,.094],[104666,.14],[176225,.16],[Infinity,.195],[Infinity,.195]] },
-  "Nova Scotia":  { bpa:11481, brackets:[[30995,.0879],[61991,.1495],[97417,.1667],[157124,.175],[Infinity,.21]] },
-  PEI:            { bpa:13500, brackets:[[33928,.095],[65820,.1347],[106890,.1637],[142250,.182],[Infinity,.187]] },
-  Newfoundland:   { bpa:11067, brackets:[[44678,.087],[89354,.145],[159528,.158],[223340,.178],[Infinity,.218]] },
-};
+import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate } from "./tax.js";
 
-export const FED_BRACKETS_DEFAULT = { bpa:16429, brackets:[[58523,.14],[117045,.205],[181440,.26],[258482,.29],[Infinity,.33]] };
-
-export function calcProgressiveTax(income, bpa, brackets) {
-  const taxable = Math.max(0, income - bpa);
-  let tax = 0, prev = 0;
-  for (const [threshold, rate] of brackets) {
-    const bracketTop = threshold - bpa;
-    const inBracket = Math.max(0, Math.min(taxable - prev, bracketTop - prev));
-    tax += inBracket * rate;
-    prev = bracketTop;
-    if (taxable <= bracketTop) break;
+// ═══════════════════════════════════════════════
+// INCOME SMOOTHING
+// ═══════════════════════════════════════════════
+export function getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome) {
+  if (age < 65) return activeIncome;
+  if (age < 70) {
+    const t = (age - 65) / 5;
+    return activeIncome + (slowdownIncome - activeIncome) * t;
   }
-  return tax;
+  if (age < 80) return slowdownIncome;
+  if (age < 85) {
+    const t = (age - 80) / 5;
+    return slowdownIncome + (inactiveIncome - slowdownIncome) * t;
+  }
+  return inactiveIncome;
+}
+
+export function getPhaseLabel(age, isRetired) {
+  if (!isRetired) return "Accumulation";
+  if (age < 65) return "Active";
+  if (age < 70) return "Active \u2192 Slow";
+  if (age < 80) return "Slowdown";
+  if (age < 85) return "Slow \u2192 Inactive";
+  return "Inactive";
 }
 
 // ═══════════════════════════════════════════════
 // CORE PROJECTION ENGINE
 // ═══════════════════════════════════════════════
-export function runProjection(inputs) {
+export function runProjection(inputs, strategy = "optimize") {
   const { currentAge, retirementAge, lifeExpectancy, province,
     rrspBal, tfsaBal, nonRegBal, savingsBal,
     rrspContrib, tfsaContrib, nonRegContrib, savingsContrib,
     activeIncome, slowdownIncome, inactiveIncome,
+    pensionIncome, pensionBridge, otherIncome,
     preGrowth, postGrowth, inflation,
     cppAt65, oasAt65, oasClawbackThreshold,
     fedBrackets } = inputs;
+
+  // originalRetirementAge gates pension/bridge (DB pension starts at originally planned age)
+  // retirementAge gates when portfolio withdrawals and desired spending begin
+  const originalRetirementAge = inputs.originalRetirementAge || retirementAge;
 
   const provData = PROVINCES[province] || PROVINCES.Ontario;
 
@@ -67,28 +69,37 @@ export function runProjection(inputs) {
   // Year-by-year projection
   const rows = [];
   let rrsp = rrspBal, tfsa = tfsaBal, nonReg = nonRegBal, savings = savingsBal;
+  let tfsaRoom = 0; // TFSA contribution room starts at 0 today
+  let nonRegCostBasis = nonRegBal; // track cost basis for capital gains calculation
 
   for (let year = 1; year <= (lifeExpectancy - currentAge + 1); year++) {
     const age = currentAge + year - 1;
     if (age > lifeExpectancy) break;
     const infFactor = Math.pow(1 + inflation, year);
     const isRetired = age >= retirementAge;
-    const phase = !isRetired ? "Accumulation" : age < 70 ? "Active" : age < 85 ? "Slowdown" : "Inactive";
+    const phase = getPhaseLabel(age, isRetired);
     const growthRate = isRetired ? postGrowth : preGrowth;
 
     // Government benefits
     const cpp = age >= optCpp.age ? optCpp.annual * infFactor : 0;
     const oasGross = age >= optOas.age ? optOas.annual * infFactor : 0;
 
-    // Desired income (nominal)
+    // Pension starts at the originally planned retirement age (DB pension benefit).
+    // Bridge benefit covers the gap from originally planned retirement to age 65.
+    // Other income (rental, part-time, etc.) is inflation-adjusted and starts at retirement.
+    const pension = age >= originalRetirementAge ? pensionIncome : 0;
+    const bridge = (age >= originalRetirementAge && age < 65) ? pensionBridge : 0;
+    const other = isRetired ? otherIncome * infFactor : 0;
+
+    // Desired income (nominal) — smoothed transitions between phases
     let desiredBase = 0;
     if (isRetired) {
-      desiredBase = age < 70 ? activeIncome : age < 85 ? slowdownIncome : inactiveIncome;
+      desiredBase = getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome);
     }
     const desiredNominal = desiredBase * infFactor;
 
-    // Portfolio need from savings
-    const portfolioNeed = Math.max(0, desiredNominal - cpp - oasGross);
+    // Portfolio need from savings (after all guaranteed income sources)
+    const portfolioNeed = Math.max(0, desiredNominal - cpp - oasGross - pension - bridge - other);
 
     // Available balances (with growth applied)
     const rrspAvail = rrsp * (1 + growthRate);
@@ -98,48 +109,155 @@ export function runProjection(inputs) {
 
     // OAS clawback threshold (nominal)
     const oasThreshNom = oasClawbackThreshold * infFactor;
-    const rrspCap = Math.max(0, oasThreshNom - cpp - oasGross);
 
-    let savWd = 0, nrWd = 0, rrspWd = 0, tfsaWd = 0;
-    if (isRetired) {
-      // 1. Savings first
-      savWd = Math.min(savAvail, portfolioNeed);
-      let rem = portfolioNeed - savWd;
-      // 2. Non-Reg
-      nrWd = Math.min(nonRegAvail, rem);
-      rem -= nrWd;
-      // 3. RRSP (capped for OAS)
-      rrspWd = Math.min(rrspAvail, rem, rrspCap);
-      rem -= rrspWd;
-      // 4. TFSA
-      tfsaWd = Math.min(tfsaAvail, rem);
-    }
-
-    // Update balances
-    if (isRetired) {
-      rrsp = Math.max(0, rrspAvail - rrspWd);
-      tfsa = Math.max(0, tfsaAvail - tfsaWd);
-      nonReg = Math.max(0, nonRegAvail - nrWd);
-      savings = Math.max(0, savAvail - savWd);
-    } else {
-      rrsp = rrsp * (1 + preGrowth) + rrspContrib;
-      tfsa = tfsa * (1 + preGrowth) + tfsaContrib;
-      nonReg = nonReg * (1 + preGrowth) + nonRegContrib;
-      savings = savings + savingsContrib;
-    }
-
-    const totalPortfolio = rrsp + tfsa + nonReg + savings;
-
-    // Taxable income: RRSP withdrawal + CPP + OAS + NonReg growth (50% inclusion)
-    const nrGrowthTaxable = isRetired ? (nonReg > 0 ? (nonRegAvail - (nonReg + nrWd)) * 0 + nonRegAvail * postGrowth * 0.5 : 0) : 0;
-    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + Math.max(0, nonRegAvail * postGrowth * 0.5) : 0;
-
-    // Tax calculation
+    // Tax bracket info for this year
     const fedBpa = fedBrackets.bpa * infFactor;
     const fedBrk = fedBrackets.brackets.map(([t, r]) => [t * infFactor, r]);
     const provBpa = provData.bpa * infFactor;
     const provBrk = provData.brackets.map(([t, r]) => [t * infFactor, r]);
 
+    let savWd = 0, nrWd = 0, rrspWd = 0, tfsaWd = 0;
+    if (isRetired) {
+      // ── Tax-aware withdrawal allocation ──
+
+      // Step 1: Cash savings first (no growth, no tax cost)
+      const cashFloor = strategy === "spend_down" ? 0 : (desiredNominal / 12) * 2;
+      const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
+      savWd = Math.min(savAvailAfterFloor, portfolioNeed);
+      let rem = portfolioNeed - savWd;
+
+      const lockedIncome = cpp + oasGross + pension + bridge + other;
+      const receivingOas = oasGross > 0;
+
+      if (receivingOas) {
+        // ── OAS-aware order: RRSP (capped) → Non-reg → TFSA ──
+        // Cap RRSP at OAS clawback threshold to minimize clawback
+        const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+        rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+        rem -= rrspWd;
+
+        // Step 3: Non-registered (50% capital gains inclusion)
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        // Step 4: TFSA last (preserve tax-free compounding)
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
+      } else {
+        // ── Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA ──
+        // No OAS clawback risk, so draw down RRSP freely and preserve TFSA
+        rrspWd = Math.min(rrspAvail, rem);
+        rem -= rrspWd;
+
+        // Non-registered next
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        // TFSA only if still short
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
+      }
+
+      // Step 5: If still short, dip into the cash floor as a last resort
+      if (rem > 0) {
+        const extraSav = Math.min(savAvail - savWd, rem);
+        savWd += extraSav;
+        rem -= extraSav;
+      }
+
+      // Step 6: If still short (OAS mode cap), pull more RRSP beyond OAS cap.
+      // Meeting spending needs is more important than avoiding OAS clawback.
+      if (rem > 0) {
+        const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
+        rrspWd += extraRrsp;
+        rem -= extraRrsp;
+      }
+
+      // ── RRSP top-up: draw extra RRSP if current marginal rate < terminal rate ──
+      if (strategy === "optimize" || strategy === "max_estate") {
+        const yearsToEnd = lifeExpectancy - age;
+        const currentRrspIncome = lockedIncome + rrspWd;
+        const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
+        const rrspAfterWd = rrspAvail - rrspWd;
+        const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrackets, infFactor);
+
+        let extraRrsp = 0;
+        if (strategy === "max_estate" && yearsToEnd > 0) {
+          const annualTarget = rrspAfterWd / yearsToEnd;
+          extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+          let testIncome = currentRrspIncome;
+          for (const [threshold] of fedBrk) {
+            const bracketEdge = threshold;
+            if (bracketEdge > testIncome) {
+              const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
+              if (rateAtEdge >= terminalRate) {
+                extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                break;
+              }
+              testIncome = bracketEdge;
+            }
+          }
+          extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+        }
+
+        if (extraRrsp > 0) {
+          rrspWd += extraRrsp;
+        }
+      }
+    }
+
+    // Non-reg capital gains: compute gain fraction BEFORE updating cost basis
+    // Only the gain portion of the withdrawal is taxable at 50% inclusion
+    const nrGainFraction = nonRegAvail > 0 ? Math.max(0, 1 - nonRegCostBasis / nonRegAvail) : 0;
+    const nrTaxableGain = nrWd * nrGainFraction * 0.5;
+
+    // The RRSP top-up excess is an internal rebalance, not spendable income.
+    const rrspToTfsaTransfer = isRetired ? Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed) : 0;
+
+    // Update balances
+    // TFSA contribution room: $7K/year accrues, withdrawals restore room
+    tfsaRoom += 7000;
+    if (isRetired) {
+      tfsaRoom += tfsaWd; // withdrawals restore contribution room
+
+      // RRSP top-up excess goes to TFSA up to available contribution room.
+      // Any overflow goes to non-registered.
+      const extraFromTopUp = rrspToTfsaTransfer;
+      const toTfsa = Math.min(extraFromTopUp, tfsaRoom);
+      const toNonReg = extraFromTopUp - toTfsa;
+      tfsaRoom -= toTfsa;
+
+      rrsp = Math.max(0, rrspAvail - rrspWd);
+      tfsa = Math.max(0, tfsaAvail - tfsaWd) + toTfsa;
+      nonReg = Math.max(0, nonRegAvail - nrWd) + toNonReg;
+      savings = Math.max(0, savAvail - savWd);
+      // Update cost basis: reduce proportionally on withdrawal, increase by top-up overflow
+      if (nonRegAvail > 0 && nrWd > 0) {
+        nonRegCostBasis = nonRegCostBasis * (1 - nrWd / nonRegAvail) + toNonReg;
+      } else {
+        nonRegCostBasis += toNonReg;
+      }
+    } else {
+      tfsaRoom -= tfsaContrib; // pre-retirement contributions use room
+      rrsp = rrsp * (1 + preGrowth) + rrspContrib;
+      tfsa = tfsa * (1 + preGrowth) + tfsaContrib;
+      nonReg = nonReg * (1 + preGrowth) + nonRegContrib;
+      nonRegCostBasis += nonRegContrib; // new contributions are at cost
+      savings = savings + savingsContrib;
+    }
+
+    const totalPortfolio = rrsp + tfsa + nonReg + savings;
+
+    // Taxable income includes full RRSP withdrawal (including top-up rebalance),
+    // because the top-up IS real taxable income that the user pays tax on.
+    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain : 0;
+
+    // Tax calculation
     const fedTax = isRetired ? calcProgressiveTax(taxableIncome, fedBpa, fedBrk) : 0;
     const provTax = isRetired ? calcProgressiveTax(taxableIncome, provBpa, provBrk) : 0;
     const totalTax = fedTax + provTax;
@@ -147,14 +265,15 @@ export function runProjection(inputs) {
     // OAS clawback
     const oasClawback = isRetired ? Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15)) : 0;
 
-    // Net income
-    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross - totalTax - oasClawback : 0;
+    // Net income — total income minus tax, minus OAS clawback, minus the RRSP top-up
+    // transfer (which went to TFSA/non-reg and is not spendable cash)
+    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback - rrspToTfsaTransfer : 0;
 
     rows.push({
       year, age, phase, rrsp, tfsa, nonReg, savings,
-      cpp, oasGross, totalPortfolio,
+      cpp, oasGross, pension, bridge, other, totalPortfolio,
       contribution: isRetired ? 0 : rrspContrib + tfsaContrib + nonRegContrib + savingsContrib,
-      desiredNominal, savWd, nrWd, rrspWd, tfsaWd,
+      desiredNominal, savWd, nrWd, rrspWd, tfsaWd, rrspToTfsaTransfer,
       taxableIncome, totalTax, oasClawback, netIncome,
       realPortfolio: totalPortfolio / infFactor,
     });
@@ -164,31 +283,31 @@ export function runProjection(inputs) {
   const retRow = rows.find(r => r.age === retirementAge);
   const portfolioAtRet = retRow ? retRow.totalPortfolio : 0;
 
-  let pvDraws = 0;
-  for (const r of rows) {
-    if (r.age >= retirementAge && r.age <= lifeExpectancy) {
-      const totalDraw = r.savWd + r.nrWd + r.rrspWd + r.tfsaWd;
-      const yearsFromRet = r.age - retirementAge;
-      pvDraws += totalDraw / Math.pow(1 + postGrowth, yearsFromRet);
-    }
+  // Surplus and estate value
+  const lastRow = rows[rows.length - 1];
+  const hasSurplus = lastRow && lastRow.totalPortfolio > 0;
+
+  // Post-tax estate value estimate
+  let estateValue = null;
+  if (lastRow) {
+    const finalInfFactor = Math.pow(1 + inflation, rows.length);
+    const termRate = estimateTerminalTaxRate(lastRow.rrsp, provData, fedBrackets, finalInfFactor);
+    const nrTaxRate = termRate * 0.5;
+    estateValue = {
+      tfsa: lastRow.tfsa,
+      savings: lastRow.savings,
+      nonReg: lastRow.nonReg * (1 - nrTaxRate * 0.3),
+      rrsp: lastRow.rrsp * (1 - termRate),
+      total: 0,
+    };
+    estateValue.total = estateValue.tfsa + estateValue.savings + estateValue.nonReg + estateValue.rrsp;
   }
-  const fundingRatio = pvDraws > 0 ? portfolioAtRet / pvDraws : 999;
 
   return {
     rows, cppOptions, oasOptions, optCpp, optOas,
-    portfolioAtRet, pvDraws, fundingRatio,
+    portfolioAtRet, hasSurplus, estateValue,
     activeYears: Math.max(0, Math.min(70, lifeExpectancy) - retirementAge),
     slowdownYears: Math.max(0, Math.min(85, lifeExpectancy) - Math.max(70, retirementAge)),
     inactiveYears: Math.max(0, lifeExpectancy - Math.max(85, retirementAge)),
   };
 }
-
-export const DEFAULTS = {
-  currentAge: 35, retirementAge: 65, lifeExpectancy: 90, province: "Ontario",
-  rrspBal: 50000, tfsaBal: 40000, nonRegBal: 20000, savingsBal: 15000,
-  rrspContrib: 10000, tfsaContrib: 7000, nonRegContrib: 5000, savingsContrib: 3000,
-  activeIncome: 70000, slowdownIncome: 55000, inactiveIncome: 40000,
-  preGrowth: 0.06, postGrowth: 0.04, inflation: 0.02,
-  cppAt65: 17196, oasAt65: 8908, oasClawbackThreshold: 95323,
-  fedBrackets: FED_BRACKETS_DEFAULT,
-};
