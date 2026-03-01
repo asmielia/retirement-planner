@@ -9,4 +9,8 @@ export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(commitCount),
   },
+  test: {
+    globals: true,
+    environment: 'node',
+  },
 })
