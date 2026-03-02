@@ -44,6 +44,18 @@ export function getCombinedMarginalRate(income, fedBpa, fedBrackets, provBpa, pr
   return getMarginalRate(income, fedBpa, fedBrackets) + getMarginalRate(income, provBpa, provBrackets);
 }
 
+export function calcTotalTaxAndClawback(
+  rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain,
+  fedBpa, fedBrk, provBpa, provBrk, oasThreshNom
+) {
+  const taxableIncome = rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain;
+  const fedTax = calcProgressiveTax(taxableIncome, fedBpa, fedBrk);
+  const provTax = calcProgressiveTax(taxableIncome, provBpa, provBrk);
+  const totalTax = fedTax + provTax;
+  const oasClawback = Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15));
+  return { taxableIncome, totalTax, oasClawback };
+}
+
 export function estimateTerminalTaxRate(rrspBal, provData, fedBrackets, infFactor) {
   // At death the full RRSP balance is deemed taxable income
   const fedBpa = fedBrackets.bpa * infFactor;

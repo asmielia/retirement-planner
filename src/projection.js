@@ -1,4 +1,4 @@
-import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate } from "./tax.js";
+import { PROVINCES, calcProgressiveTax, calcTotalTaxAndClawback, getCombinedMarginalRate, estimateTerminalTaxRate } from "./tax.js";
 
 // ═══════════════════════════════════════════════
 // INCOME SMOOTHING
@@ -24,6 +24,77 @@ export function getPhaseLabel(age, isRetired) {
   if (age < 80) return "Slowdown";
   if (age < 85) return "Slow \u2192 Inactive";
   return "Inactive";
+}
+
+// ═══════════════════════════════════════════════
+// WITHDRAWAL + TAX COMPUTATION (pure, no mutation)
+// ═══════════════════════════════════════════════
+function computeWithdrawalsAndTax(grossTarget, {
+  strategy, cpp, oasGross, pension, bridge, other,
+  rrspAvail, tfsaAvail, nonRegAvail, savAvail,
+  oasThreshNom, fedBpa, fedBrk, provBpa, provBrk,
+  nrGainFraction,
+}) {
+  const lockedIncome = cpp + oasGross + pension + bridge + other;
+  const portfolioNeed = Math.max(0, grossTarget - lockedIncome);
+
+  // Step 1: Cash savings first (no growth, no tax cost)
+  const cashFloor = strategy === "spend_down" ? 0 : (grossTarget / 12) * 2;
+  const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
+  let savWd = Math.min(savAvailAfterFloor, portfolioNeed);
+  let rem = portfolioNeed - savWd;
+
+  const receivingOas = oasGross > 0;
+  let rrspWd, nrWd, tfsaWd;
+
+  if (receivingOas) {
+    // OAS-aware order: RRSP (capped) → Non-reg → TFSA
+    const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
+    rrspWd = Math.min(rrspAvail, rem, rrspRoom);
+    rem -= rrspWd;
+
+    nrWd = Math.min(nonRegAvail, rem);
+    rem -= nrWd;
+
+    tfsaWd = Math.min(tfsaAvail, rem);
+    rem -= tfsaWd;
+  } else {
+    // Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA
+    rrspWd = Math.min(rrspAvail, rem);
+    rem -= rrspWd;
+
+    nrWd = Math.min(nonRegAvail, rem);
+    rem -= nrWd;
+
+    tfsaWd = Math.min(tfsaAvail, rem);
+    rem -= tfsaWd;
+  }
+
+  // Dip into cash floor as last resort
+  if (rem > 0) {
+    const extraSav = Math.min(savAvail - savWd, rem);
+    savWd += extraSav;
+    rem -= extraSav;
+  }
+
+  // If still short (OAS mode cap), pull more RRSP beyond OAS cap
+  if (rem > 0) {
+    const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
+    rrspWd += extraRrsp;
+    rem -= extraRrsp;
+  }
+
+  // Compute tax and clawback
+  const nrTaxableGain = nrWd * nrGainFraction * 0.5;
+  const { taxableIncome, totalTax, oasClawback } = calcTotalTaxAndClawback(
+    rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain,
+    fedBpa, fedBrk, provBpa, provBrk, oasThreshNom
+  );
+
+  // Net income = all cash in minus tax minus clawback (no RRSP top-up transfer here)
+  const netIncome = savWd + nrWd + rrspWd + tfsaWd + lockedIncome - totalTax - oasClawback;
+
+  return { savWd, nrWd, rrspWd, tfsaWd, nrTaxableGain, taxableIncome, totalTax, oasClawback, netIncome, portfolioNeed };
 }
 
 // ═══════════════════════════════════════════════
@@ -92,14 +163,12 @@ export function runProjection(inputs, strategy = "optimize") {
     const other = isRetired ? otherIncome * infFactor : 0;
 
     // Desired income (nominal) — smoothed transitions between phases
+    // This is now the NET target (after tax + OAS clawback)
     let desiredBase = 0;
     if (isRetired) {
       desiredBase = getSmoothedIncome(age, activeIncome, slowdownIncome, inactiveIncome);
     }
     const desiredNominal = desiredBase * infFactor;
-
-    // Portfolio need from savings (after all guaranteed income sources)
-    const portfolioNeed = Math.max(0, desiredNominal - cpp - oasGross - pension - bridge - other);
 
     // Available balances (with growth applied)
     const rrspAvail = rrsp * (1 + growthRate);
@@ -116,108 +185,142 @@ export function runProjection(inputs, strategy = "optimize") {
     const provBpa = provData.bpa * infFactor;
     const provBrk = provData.brackets.map(([t, r]) => [t * infFactor, r]);
 
-    let savWd = 0, nrWd = 0, rrspWd = 0, tfsaWd = 0;
-    if (isRetired) {
-      // ── Tax-aware withdrawal allocation ──
+    // Non-reg capital gains: compute gain fraction BEFORE withdrawals
+    const nrGainFraction = nonRegAvail > 0 ? Math.max(0, 1 - nonRegCostBasis / nonRegAvail) : 0;
 
-      // Step 1: Cash savings first (no growth, no tax cost)
-      const cashFloor = strategy === "spend_down" ? 0 : (desiredNominal / 12) * 2;
-      const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
-      savWd = Math.min(savAvailAfterFloor, portfolioNeed);
-      let rem = portfolioNeed - savWd;
+    let savWd = 0, nrWd = 0, rrspWd = 0, tfsaWd = 0;
+    let nrTaxableGain = 0, taxableIncome = 0, totalTax = 0, oasClawback = 0, netIncome = 0;
+    let grossNominal = 0;
+
+    if (isRetired) {
+      // ── Iterative net-income targeting ──
+      // The user's desired income is a NET target (after tax + clawback).
+      // We iterate to find the gross amount that delivers this net.
+      const yearState = {
+        strategy, cpp, oasGross, pension, bridge, other,
+        rrspAvail, tfsaAvail, nonRegAvail, savAvail,
+        oasThreshNom, fedBpa, fedBrk, provBpa, provBrk,
+        nrGainFraction,
+      };
 
       const lockedIncome = cpp + oasGross + pension + bridge + other;
-      const receivingOas = oasGross > 0;
+      let grossEstimate = desiredNominal;
+      let result;
 
-      if (receivingOas) {
-        // ── OAS-aware order: RRSP (capped) → Non-reg → TFSA ──
-        // Cap RRSP at OAS clawback threshold to minimize clawback
-        const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
-        rrspWd = Math.min(rrspAvail, rem, rrspRoom);
-        rem -= rrspWd;
+      for (let iter = 0; iter < 10; iter++) {
+        result = computeWithdrawalsAndTax(grossEstimate, yearState);
 
-        // Step 3: Non-registered (50% capital gains inclusion)
-        nrWd = Math.min(nonRegAvail, rem);
-        rem -= nrWd;
+        // Compute RRSP top-up inside the iteration so its tax impact is accounted for
+        let topUpRrsp = 0;
+        if (strategy === "optimize" || strategy === "max_estate") {
+          const currentRrspIncome = lockedIncome + result.rrspWd;
+          const rrspAfterWd = rrspAvail - result.rrspWd;
+          const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrackets, infFactor);
 
-        // Step 4: TFSA last (preserve tax-free compounding)
-        tfsaWd = Math.min(tfsaAvail, rem);
-        rem -= tfsaWd;
-      } else {
-        // ── Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA ──
-        // No OAS clawback risk, so draw down RRSP freely and preserve TFSA
-        rrspWd = Math.min(rrspAvail, rem);
-        rem -= rrspWd;
+          if (strategy === "max_estate" && (lifeExpectancy - age) > 0) {
+            const annualTarget = rrspAfterWd / (lifeExpectancy - age);
+            topUpRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - result.rrspWd));
+            const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+            topUpRrsp = Math.max(0, Math.min(topUpRrsp, maxRrspForOas - result.rrspWd));
+          } else if (strategy === "optimize") {
+            const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
+            if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+              let testIncome = currentRrspIncome;
+              for (const [threshold] of fedBrk) {
+                const bracketEdge = threshold;
+                if (bracketEdge > testIncome) {
+                  const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
+                  if (rateAtEdge >= terminalRate) {
+                    topUpRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                    break;
+                  }
+                  testIncome = bracketEdge;
+                }
+              }
+              topUpRrsp = Math.min(topUpRrsp, rrspAfterWd);
+              const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+              topUpRrsp = Math.max(0, Math.min(topUpRrsp, maxRrspForOas - result.rrspWd));
+            }
+          }
+        }
 
-        // Non-registered next
-        nrWd = Math.min(nonRegAvail, rem);
-        rem -= nrWd;
+        // Recompute tax with spending + top-up combined
+        const finalRrspWd = result.rrspWd + topUpRrsp;
+        const finalNrTaxGain = result.nrWd * nrGainFraction * 0.5;
+        const finalTax = calcTotalTaxAndClawback(
+          finalRrspWd, cpp, oasGross, pension, bridge, other, finalNrTaxGain,
+          fedBpa, fedBrk, provBpa, provBrk, oasThreshNom
+        );
 
-        // TFSA only if still short
-        tfsaWd = Math.min(tfsaAvail, rem);
-        rem -= tfsaWd;
+        // Net = spending withdrawals + benefits - full tax - clawback
+        // (top-up withdrawal and transfer cancel out, but top-up's tax reduces net)
+        const spendingWd = result.savWd + result.nrWd + result.rrspWd + result.tfsaWd;
+        const iterNet = spendingWd + lockedIncome - finalTax.totalTax - finalTax.oasClawback;
+
+        const gap = desiredNominal - iterNet;
+        if (Math.abs(gap) < 1.0) break;
+        grossEstimate += gap;
       }
 
-      // Step 5: If still short, dip into the cash floor as a last resort
-      if (rem > 0) {
-        const extraSav = Math.min(savAvail - savWd, rem);
-        savWd += extraSav;
-        rem -= extraSav;
-      }
+      savWd = result.savWd;
+      nrWd = result.nrWd;
+      rrspWd = result.rrspWd;
+      tfsaWd = result.tfsaWd;
+      grossNominal = grossEstimate;
 
-      // Step 6: If still short (OAS mode cap), pull more RRSP beyond OAS cap.
-      // Meeting spending needs is more important than avoiding OAS clawback.
-      if (rem > 0) {
-        const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
-        rrspWd += extraRrsp;
-        rem -= extraRrsp;
-      }
-
-      // ── RRSP top-up: draw extra RRSP if current marginal rate < terminal rate ──
+      // Apply the final top-up to rrspWd
       if (strategy === "optimize" || strategy === "max_estate") {
-        const yearsToEnd = lifeExpectancy - age;
         const currentRrspIncome = lockedIncome + rrspWd;
-        const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
         const rrspAfterWd = rrspAvail - rrspWd;
         const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrackets, infFactor);
 
         let extraRrsp = 0;
-        if (strategy === "max_estate" && yearsToEnd > 0) {
-          const annualTarget = rrspAfterWd / yearsToEnd;
+        if (strategy === "max_estate" && (lifeExpectancy - age) > 0) {
+          const annualTarget = rrspAfterWd / (lifeExpectancy - age);
           extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
           const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
           extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
-        } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
-          let testIncome = currentRrspIncome;
-          for (const [threshold] of fedBrk) {
-            const bracketEdge = threshold;
-            if (bracketEdge > testIncome) {
-              const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
-              if (rateAtEdge >= terminalRate) {
-                extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
-                break;
+        } else if (strategy === "optimize") {
+          const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
+          if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+            let testIncome = currentRrspIncome;
+            for (const [threshold] of fedBrk) {
+              const bracketEdge = threshold;
+              if (bracketEdge > testIncome) {
+                const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
+                if (rateAtEdge >= terminalRate) {
+                  extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                  break;
+                }
+                testIncome = bracketEdge;
               }
-              testIncome = bracketEdge;
             }
+            extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+            const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+            extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
           }
-          extraRrsp = Math.min(extraRrsp, rrspAfterWd);
-          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
-          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
         }
-
-        if (extraRrsp > 0) {
-          rrspWd += extraRrsp;
-        }
+        if (extraRrsp > 0) rrspWd += extraRrsp;
       }
+
+      // Recompute tax with final rrspWd (including top-up)
+      nrTaxableGain = nrWd * nrGainFraction * 0.5;
+      const finalTax = calcTotalTaxAndClawback(
+        rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain,
+        fedBpa, fedBrk, provBpa, provBrk, oasThreshNom
+      );
+      taxableIncome = finalTax.taxableIncome;
+      totalTax = finalTax.totalTax;
+      oasClawback = finalTax.oasClawback;
     }
 
-    // Non-reg capital gains: compute gain fraction BEFORE updating cost basis
-    // Only the gain portion of the withdrawal is taxable at 50% inclusion
-    const nrGainFraction = nonRegAvail > 0 ? Math.max(0, 1 - nonRegCostBasis / nonRegAvail) : 0;
-    const nrTaxableGain = nrWd * nrGainFraction * 0.5;
-
     // The RRSP top-up excess is an internal rebalance, not spendable income.
+    const portfolioNeed = isRetired ? Math.max(0, grossNominal - (cpp + oasGross + pension + bridge + other)) : 0;
     const rrspToTfsaTransfer = isRetired ? Math.max(0, (savWd + nrWd + rrspWd + tfsaWd) - portfolioNeed) : 0;
+
+    // Net income — total income minus tax, minus OAS clawback, minus the RRSP top-up
+    // transfer (which went to TFSA/non-reg and is not spendable cash)
+    netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback - rrspToTfsaTransfer : 0;
 
     // Update balances
     // TFSA contribution room: $7K/year accrues, withdrawals restore room
@@ -253,27 +356,11 @@ export function runProjection(inputs, strategy = "optimize") {
 
     const totalPortfolio = rrsp + tfsa + nonReg + savings;
 
-    // Taxable income includes full RRSP withdrawal (including top-up rebalance),
-    // because the top-up IS real taxable income that the user pays tax on.
-    const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain : 0;
-
-    // Tax calculation
-    const fedTax = isRetired ? calcProgressiveTax(taxableIncome, fedBpa, fedBrk) : 0;
-    const provTax = isRetired ? calcProgressiveTax(taxableIncome, provBpa, provBrk) : 0;
-    const totalTax = fedTax + provTax;
-
-    // OAS clawback
-    const oasClawback = isRetired ? Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15)) : 0;
-
-    // Net income — total income minus tax, minus OAS clawback, minus the RRSP top-up
-    // transfer (which went to TFSA/non-reg and is not spendable cash)
-    const netIncome = isRetired ? savWd + nrWd + rrspWd + tfsaWd + cpp + oasGross + pension + bridge + other - totalTax - oasClawback - rrspToTfsaTransfer : 0;
-
     rows.push({
       year, age, phase, rrsp, tfsa, nonReg, savings,
       cpp, oasGross, pension, bridge, other, totalPortfolio,
       contribution: isRetired ? 0 : rrspContrib + tfsaContrib + nonRegContrib + savingsContrib,
-      desiredNominal, savWd, nrWd, rrspWd, tfsaWd, rrspToTfsaTransfer,
+      desiredNominal, grossNominal, savWd, nrWd, rrspWd, tfsaWd, rrspToTfsaTransfer,
       taxableIncome, totalTax, oasClawback, netIncome,
       realPortfolio: totalPortfolio / infFactor,
     });

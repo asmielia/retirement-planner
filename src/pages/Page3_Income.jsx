@@ -5,12 +5,12 @@ export default function Page3_Income({ inputs, setField, isCouple, names }) {
     ? `${inputs.name} & ${inputs.partner.name}'s Retirement Lifestyle`
     : "Your Combined Retirement Lifestyle";
   const coupleSubtitle = inputs.name && inputs.partner?.name
-    ? `How much combined annual income do ${inputs.name} and ${inputs.partner.name} need in retirement? These are your total household spending targets.`
-    : "How much combined annual income do you and your partner need in retirement? These are your total household spending targets.";
+    ? `How much combined after-tax annual income do ${inputs.name} and ${inputs.partner.name} need in retirement? These are your total household spending targets — the amount you'll actually have in your pocket.`
+    : "How much combined after-tax annual income do you and your partner need in retirement? These are your total household spending targets — the amount you'll actually have in your pocket.";
   return (
     <div>
       <SectionTitle icon="🏖️" title={isCouple ? coupleTitle : `${names.youPossessive} Retirement Lifestyle`}
-        subtitle={isCouple ? coupleSubtitle : "How much annual income do you need in retirement? Most people spend more in early retirement (travel, hobbies) and less as they age."} />
+        subtitle={isCouple ? coupleSubtitle : "How much after-tax annual income do you need in retirement? This is money in your pocket after taxes. Most people spend more in early retirement (travel, hobbies) and less as they age."} />
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
         {[
           { key: "activeIncome", label: "Active Phase", ages: `Retirement–65, ramps 65–70`, icon: "✈️", desc: "Travel, dining out, new hobbies" },
@@ -21,12 +21,12 @@ export default function Page3_Income({ inputs, setField, isCouple, names }) {
             <div className="text-2xl mb-2">{p.icon}</div>
             <div className="text-sm font-semibold text-white mb-1">{p.label} <span className="text-slate-500 font-normal">({p.ages})</span></div>
             <div className="text-xs text-slate-400 mb-3">{p.desc}</div>
-            <Field label={isCouple ? "Combined Annual Income (Today's $)" : "Annual Income (Today's $)"} value={inputs[p.key]} onChange={v => setField(p.key, v)} />
+            <Field label={isCouple ? "Combined After-Tax Income (Today's $)" : "After-Tax Income (Today's $)"} value={inputs[p.key]} onChange={v => setField(p.key, v)} />
           </div>
         ))}
       </div>
       <Explanation>
-        These amounts are in today's dollars — the model automatically adjusts for inflation each year. Income transitions smoothly over 5 years between phases (ages 65–70 and 80–85) to avoid unrealistic spending cliffs. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
+        These are after-tax amounts in today's dollars — the model automatically calculates the gross withdrawals and taxes needed to deliver this take-home income, and adjusts for inflation each year. Income transitions smoothly over 5 years between phases (ages 65–70 and 80–85) to avoid unrealistic spending cliffs. {isCouple ? "These are your combined household spending targets. Phases are based on the older partner's age." : "A common rule of thumb is 70% of pre-retirement income, declining about 20% per phase."}
       </Explanation>
     </div>
   );
