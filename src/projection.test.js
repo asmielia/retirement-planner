@@ -769,11 +769,14 @@ describe('Strategy Parameter', () => {
       rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
     }), "optimize");
     const row = r.rows.find(row => row.age === 65);
-    // cashFloor = (30000/12) * 2 = 5000
-    // savAvailAfterFloor = 100000 - 5000 = 95000
-    // portfolioNeed = 30000
-    // savWd = min(95000, 30000) = 30000
-    expect(row.savWd).toBe(30000);
+    // With net-income targeting + RRSP top-up inside iteration:
+    // grossEstimate rises to ~49351 to cover tax on RRSP top-up (~95323)
+    // cashFloor = (grossEstimate/12) * 2 ≈ 8225
+    // savWd = grossEstimate ≈ 49351 (all from cash since portfolioNeed = grossEstimate)
+    expect(row.savWd).toBeCloseTo(49351, 0);
+    // Verify cash floor is reserved: remaining savings >= cashFloor
+    const cashFloor = (row.grossNominal / 12) * 2;
+    expect(100000 - row.savWd).toBeGreaterThanOrEqual(cashFloor - 1);
   });
 
   it('O3: spend_down produces no RRSP top-up transfer', () => {
@@ -846,5 +849,83 @@ describe('Estate Value', () => {
     // RRSP estate = rrsp * (1 - terminalRate), so it should be less than the raw balance
     expect(r.estateValue.rrsp).toBeLessThan(lastRow.rrsp);
     expect(r.estateValue.rrsp).toBeGreaterThan(0);
+  });
+});
+
+// ═══════════════════════════════════════════════
+// R. Net Income Targeting
+// ═══════════════════════════════════════════════
+describe('Net Income Targeting', () => {
+  it('R1: net income equals desired when portfolio is sufficient', () => {
+    const r = runProjection(makeInputs({
+      retirementAge: 65, currentAge: 64,
+      rrspBal: 500000, tfsaBal: 200000, nonRegBal: 100000, savingsBal: 50000,
+      activeIncome: 60000, inflation: 0, postGrowth: 0,
+      lifeExpectancy: 90,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+    }), "spend_down");
+    const row = r.rows.find(row => row.age === 65);
+    // desiredNominal = 60000 (net target), netIncome should match within iteration tolerance
+    expect(Math.abs(row.netIncome - row.desiredNominal)).toBeLessThan(2);
+  });
+
+  it('R2: RRSP-only grosses up to cover tax', () => {
+    const r = runProjection(makeInputs({
+      retirementAge: 65, currentAge: 65,
+      rrspBal: 500000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
+      activeIncome: 50000, inflation: 0, postGrowth: 0,
+      lifeExpectancy: 90,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+    }), "spend_down");
+    const row = r.rows.find(row => row.age === 65);
+    // RRSP is fully taxable, so rrspWd > 50000 to deliver 50000 net
+    expect(row.rrspWd).toBeGreaterThan(50000);
+    expect(row.grossNominal).toBeGreaterThan(row.desiredNominal);
+    // Iteration converges within $1 tolerance
+    expect(Math.abs(row.netIncome - 50000)).toBeLessThan(2);
+  });
+
+  it('R3: TFSA-only needs no gross-up', () => {
+    const r = runProjection(makeInputs({
+      retirementAge: 65, currentAge: 65,
+      rrspBal: 0, tfsaBal: 500000, nonRegBal: 0, savingsBal: 0,
+      activeIncome: 50000, inflation: 0, postGrowth: 0,
+      lifeExpectancy: 90,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+    }), "spend_down");
+    const row = r.rows.find(row => row.age === 65);
+    // TFSA is tax-free, so tfsaWd = 50000 exactly, no gross-up needed
+    expect(row.tfsaWd).toBe(50000);
+    expect(row.grossNominal).toBe(row.desiredNominal);
+    expect(row.netIncome).toBeCloseTo(50000, 0);
+  });
+
+  it('R4: iteration converges with mixed accounts', () => {
+    const r = runProjection(makeInputs({
+      retirementAge: 65, currentAge: 65,
+      rrspBal: 300000, tfsaBal: 200000, nonRegBal: 0, savingsBal: 0,
+      activeIncome: 40000, inflation: 0, postGrowth: 0,
+      lifeExpectancy: 90,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+    }), "spend_down");
+    const row = r.rows.find(row => row.age === 65);
+    // Mixed RRSP+TFSA: iteration should converge to deliver net ≈ 40000
+    expect(Math.abs(row.netIncome - 40000)).toBeLessThan(2);
+    expect(row.grossNominal).toBeGreaterThan(row.desiredNominal);
+  });
+
+  it('R5: depleted portfolio handles shortfall gracefully', () => {
+    const r = runProjection(makeInputs({
+      retirementAge: 65, currentAge: 65,
+      rrspBal: 0, tfsaBal: 0, nonRegBal: 0, savingsBal: 5000,
+      activeIncome: 70000, inflation: 0, postGrowth: 0,
+      lifeExpectancy: 90,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+    }), "spend_down");
+    const row = r.rows.find(row => row.age === 65);
+    // Can't meet 70K target with 5K savings — no crash, no NaN
+    expect(Number.isFinite(row.netIncome)).toBe(true);
+    expect(Number.isNaN(row.netIncome)).toBe(false);
+    expect(row.netIncome).toBeLessThan(70000);
   });
 });
