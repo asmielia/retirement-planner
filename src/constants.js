@@ -36,3 +36,5 @@ export const PAGES = [
 export const STORAGE_KEY = "retirement-planner-inputs";
 export const SURPLUS_STORAGE_KEY = "retirement-planner-surplus-mode";
 export const PAGE_STORAGE_KEY = "retirement-planner-page";
+export const ANTHROPIC_API_KEY_STORAGE_KEY = "retirement-planner-anthropic-key";
+export const T4_DATA_STORAGE_KEY = "retirement-planner-t4-data";

@@ -9,6 +9,16 @@ export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(commitCount),
   },
+  server: {
+    proxy: {
+      '/api/anthropic': {
+        target: 'https://api.anthropic.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/anthropic/, ''),
+        secure: true,
+      },
+    },
+  },
   test: {
     globals: true,
     environment: 'node',
