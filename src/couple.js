@@ -203,6 +203,11 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         let testIncome = currentRrspIncome;
         for (const [threshold] of fedBrackets) {
           const bracketEdge = threshold;
+          if (!isFinite(bracketEdge)) {
+            // Top bracket rate equals terminal rate — fill to last finite edge only
+            extraRrsp = Math.max(0, testIncome - currentRrspIncome);
+            break;
+          }
           if (bracketEdge > testIncome) {
             const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrackets, provBpa, provBrackets);
             if (rateAtEdge >= terminalRate) {
