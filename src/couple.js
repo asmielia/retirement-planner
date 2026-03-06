@@ -143,7 +143,21 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       const receivingOas = oasGross > 0;
       let rrspWd, nrWd, tfsaWd;
 
-      if (receivingOas) {
+      if (strategy !== "spend_down") {
+        // Proportional by balance: spread spending across RRSP, Non-Reg, TFSA
+        const rrspEffective = receivingOas
+          ? Math.min(rrspAvail, Math.max(0, oasThreshNom - lockedIncome))
+          : rrspAvail;
+        const totalAvail = rrspEffective + nonRegAvail + tfsaAvail;
+        if (totalAvail > 0 && rem > 0) {
+          rrspWd = Math.min(rrspEffective, Math.round(rem * rrspEffective / totalAvail));
+          nrWd = Math.min(nonRegAvail, Math.round(rem * nonRegAvail / totalAvail));
+          tfsaWd = Math.min(tfsaAvail, rem - rrspWd - nrWd);
+          rem -= (rrspWd + nrWd + tfsaWd);
+        } else {
+          rrspWd = 0; nrWd = 0; tfsaWd = 0;
+        }
+      } else if (receivingOas) {
         const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
         rrspWd = Math.min(rrspAvail, rem, rrspRoom);
         rem -= rrspWd;
