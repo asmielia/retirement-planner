@@ -44,6 +44,31 @@ export function getCombinedMarginalRate(income, fedBpa, fedBrackets, provBpa, pr
   return getMarginalRate(income, fedBpa, fedBrackets) + getMarginalRate(income, provBpa, provBrackets);
 }
 
+// ═══════════════════════════════════════════════
+// TAX CREDITS
+// ═══════════════════════════════════════════════
+
+// Pension income credit: first $2,000 of eligible pension income (RRIF/pension at 65+)
+// gets a non-refundable credit at the lowest federal + provincial bracket rates.
+export function calcPensionIncomeCredit(age, rrspWd, pensionIncome, fedLowestRate, provLowestRate) {
+  if (age < 65) return 0;
+  const eligible = Math.min(2000, rrspWd + pensionIncome);
+  return eligible * (fedLowestRate + provLowestRate);
+}
+
+// Age amount credit: federal $9,028 (2025) for age 65+, reduced by 15% of net income above threshold.
+// Applied as a non-refundable credit at the lowest bracket rate.
+export const AGE_CREDIT = { amount: 9028, threshold: 44325, clawbackRate: 0.15 };
+
+export function calcAgeCredit(age, netIncome, fedLowestRate, provLowestRate, infFactor = 1) {
+  if (age < 65) return 0;
+  const amount = AGE_CREDIT.amount * infFactor;
+  const threshold = AGE_CREDIT.threshold * infFactor;
+  const clawback = Math.max(0, (netIncome - threshold) * AGE_CREDIT.clawbackRate);
+  const eligibleAmount = Math.max(0, amount - clawback);
+  return eligibleAmount * (fedLowestRate + provLowestRate);
+}
+
 export function calcTotalTaxAndClawback(
   rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain,
   fedBpa, fedBrk, provBpa, provBrk, oasThreshNom

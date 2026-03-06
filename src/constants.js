@@ -38,3 +38,21 @@ export const SURPLUS_STORAGE_KEY = "retirement-planner-surplus-mode";
 export const PAGE_STORAGE_KEY = "retirement-planner-page";
 export const ANTHROPIC_API_KEY_STORAGE_KEY = "retirement-planner-anthropic-key";
 export const T4_DATA_STORAGE_KEY = "retirement-planner-t4-data";
+
+// CRA prescribed RRIF minimum withdrawal percentages by age
+// Source: https://www.canada.ca/en/revenue-agency/services/tax/businesses/topics/completing-slips-summaries/t4rsp-t4rif-information-returns/payments/chart-prescribed-factors.html
+// RRSP must be converted to RRIF by Dec 31 of the year the holder turns 71.
+// Minimum withdrawals are mandatory starting the year after conversion (age 72).
+const RRIF_MIN_RATES = {
+  72: 0.0528, 73: 0.0540, 74: 0.0553, 75: 0.0567, 76: 0.0582,
+  77: 0.0598, 78: 0.0617, 79: 0.0636, 80: 0.0658, 81: 0.0682,
+  82: 0.0708, 83: 0.0738, 84: 0.0771, 85: 0.0808, 86: 0.0851,
+  87: 0.0899, 88: 0.0956, 89: 0.1021, 90: 0.1099, 91: 0.1192,
+  92: 0.1306, 93: 0.1449, 94: 0.1634, 95: 0.2000,
+};
+
+export function getRrifMinimum(age, rrspBalance) {
+  if (age < 72 || rrspBalance <= 0) return 0;
+  const rate = age >= 95 ? 0.20 : RRIF_MIN_RATES[age] || 0.20;
+  return rrspBalance * rate;
+}

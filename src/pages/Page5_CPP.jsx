@@ -36,7 +36,7 @@ export default function Page5_CPP({ inputs, setField, personTab, isCouple, activ
             </div>
           )}
           <Explanation>
-            CPP decreases by 0.6%/month before 65 (max -36% at 60) and increases by 0.7%/month after 65 (max +42% at 70). OAS increases by 0.6%/month after 65 (max +36% at 70). With a life expectancy of {activePerson.lifeExpectancy}, delaying to {personResults?.optCpp?.age || 65} maximizes total lifetime CPP benefits.
+            CPP decreases by 0.6%/month before 65 (max -36% at 60) and increases by 0.7%/month after 65 (max +42% at 70). OAS increases by 0.6%/month after 65 (max +36% at 70), and automatically increases by 10% at age 75. With a life expectancy of {activePerson.lifeExpectancy}, delaying to {personResults?.optCpp?.age || 65} maximizes total lifetime CPP benefits.
           </Explanation>
         </div>
       </div>
