@@ -230,24 +230,30 @@ export function runProjection(inputs, strategy = "optimize") {
           } else if (strategy === "optimize") {
             const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
             if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+              // Bracket ceiling: fill to where marginal rate reaches terminal rate
+              let bracketCeiling = 0;
               let testIncome = currentRrspIncome;
               for (const [threshold] of fedBrk) {
                 const bracketEdge = threshold;
                 if (!isFinite(bracketEdge)) {
-                  // Top bracket rate equals terminal rate — fill to last finite edge only
-                  topUpRrsp = Math.max(0, testIncome - currentRrspIncome);
+                  bracketCeiling = Math.max(0, testIncome - currentRrspIncome);
                   break;
                 }
                 if (bracketEdge > testIncome) {
                   const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
                   if (rateAtEdge >= terminalRate) {
-                    topUpRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                    bracketCeiling = Math.max(0, bracketEdge - currentRrspIncome);
                     break;
                   }
                   testIncome = bracketEdge;
                 }
               }
-              topUpRrsp = Math.min(topUpRrsp, rrspAfterWd);
+              // Temporal cap: spread RRSP evenly over remaining years so we don't
+              // front-load massive withdrawals that spike taxes in early retirement
+              const yearsToEnd = lifeExpectancy - age;
+              const annualTarget = yearsToEnd > 0 ? rrspAfterWd / yearsToEnd : rrspAfterWd;
+              const temporalCap = Math.max(0, annualTarget - result.rrspWd);
+              topUpRrsp = Math.min(bracketCeiling, temporalCap, rrspAfterWd);
               const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
               topUpRrsp = Math.max(0, Math.min(topUpRrsp, maxRrspForOas - result.rrspWd));
             }
@@ -304,24 +310,29 @@ export function runProjection(inputs, strategy = "optimize") {
         } else if (strategy === "optimize") {
           const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrk, provBpa, provBrk);
           if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+            // Bracket ceiling: fill to where marginal rate reaches terminal rate
+            let bracketCeiling = 0;
             let testIncome = currentRrspIncome;
             for (const [threshold] of fedBrk) {
               const bracketEdge = threshold;
               if (!isFinite(bracketEdge)) {
-                // Top bracket rate equals terminal rate — fill to last finite edge only
-                extraRrsp = Math.max(0, testIncome - currentRrspIncome);
+                bracketCeiling = Math.max(0, testIncome - currentRrspIncome);
                 break;
               }
               if (bracketEdge > testIncome) {
                 const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
                 if (rateAtEdge >= terminalRate) {
-                  extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+                  bracketCeiling = Math.max(0, bracketEdge - currentRrspIncome);
                   break;
                 }
                 testIncome = bracketEdge;
               }
             }
-            extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+            // Temporal cap: spread RRSP evenly over remaining years
+            const yearsToEnd = lifeExpectancy - age;
+            const annualTarget = yearsToEnd > 0 ? rrspAfterWd / yearsToEnd : rrspAfterWd;
+            const temporalCap = Math.max(0, annualTarget - rrspWd);
+            extraRrsp = Math.min(bracketCeiling, temporalCap, rrspAfterWd);
             // Only cap at OAS threshold when receiving OAS — pre-OAS years are the
             // golden window for aggressive RRSP meltdown with no clawback risk
             const receivingOas = oasGross > 0;

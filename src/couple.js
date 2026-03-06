@@ -200,24 +200,28 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
         extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
       } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+        // Bracket ceiling: fill to where marginal rate reaches terminal rate
+        let bracketCeiling = 0;
         let testIncome = currentRrspIncome;
         for (const [threshold] of fedBrackets) {
           const bracketEdge = threshold;
           if (!isFinite(bracketEdge)) {
-            // Top bracket rate equals terminal rate — fill to last finite edge only
-            extraRrsp = Math.max(0, testIncome - currentRrspIncome);
+            bracketCeiling = Math.max(0, testIncome - currentRrspIncome);
             break;
           }
           if (bracketEdge > testIncome) {
             const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrackets, provBpa, provBrackets);
             if (rateAtEdge >= terminalRate) {
-              extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+              bracketCeiling = Math.max(0, bracketEdge - currentRrspIncome);
               break;
             }
             testIncome = bracketEdge;
           }
         }
-        extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+        // Temporal cap: spread RRSP evenly over remaining years
+        const annualTarget = yearsToEnd > 0 ? rrspAfterWd / yearsToEnd : rrspAfterWd;
+        const temporalCap = Math.max(0, annualTarget - rrspWd);
+        extraRrsp = Math.min(bracketCeiling, temporalCap, rrspAfterWd);
         // Only cap at OAS threshold when receiving OAS — pre-OAS years are the
         // golden window for aggressive RRSP meltdown with no clawback risk
         const receivingOas = oasGross > 0;
