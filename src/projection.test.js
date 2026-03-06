@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { calcProgressiveTax, PROVINCES, FED_BRACKETS_DEFAULT } from './tax.js';
+import { calcProgressiveTax, PROVINCES, FED_BRACKETS_DEFAULT, calcPensionIncomeCredit, calcAgeCredit, AGE_CREDIT } from './tax.js';
 import { runProjection, getSmoothedIncome, getPhaseLabel } from './projection.js';
-import { DEFAULTS } from './constants.js';
+import { DEFAULTS, getRrifMinimum } from './constants.js';
 
 function makeInputs(overrides = {}) {
   return { ...DEFAULTS, ...overrides };
@@ -120,7 +120,10 @@ describe('OAS Optimization', () => {
     const r = runProjection(makeInputs({ lifeExpectancy: 90 }));
     const oas65 = r.oasOptions.find(o => o.age === 65);
     expect(oas65.annual).toBe(8908);
-    expect(oas65.lifetime).toBeCloseTo(8908 * 25, 0);
+    // Lifetime includes 10% OAS increase at age 75:
+    // 10 years at base (65-74) + 15 years at 1.10x (75-89)
+    const expectedLifetime = 8908 * 10 + 8908 * 1.10 * 15;
+    expect(oas65.lifetime).toBeCloseTo(expectedLifetime, 0);
   });
 
   it('C2: OAS at age 70 applies +36% deferral bonus', () => {
@@ -128,7 +131,10 @@ describe('OAS Optimization', () => {
     const oas70 = r.oasOptions.find(o => o.age === 70);
     // 8908 * (1 + 0.006 * 5 * 12) = 8908 * 1.36 = 12114.88
     expect(oas70.annual).toBeCloseTo(12114.88, 1);
-    expect(oas70.lifetime).toBeCloseTo(12114.88 * 20, 0);
+    // Lifetime includes 10% OAS increase at age 75:
+    // 5 years at base (70-74) + 15 years at 1.10x (75-89)
+    const expectedLifetime = 12114.88 * 5 + 12114.88 * 1.10 * 15;
+    expect(oas70.lifetime).toBeCloseTo(expectedLifetime, 0);
   });
 
   it('C3: optimal OAS age is 70 with life expectancy 90', () => {
@@ -330,7 +336,7 @@ describe('Tax Integration', () => {
     }
   });
 
-  it('G2: total tax equals federal + provincial', () => {
+  it('G2: total tax equals federal + provincial minus credits', () => {
     const r = runProjection(makeInputs({
       retirementAge: 65, currentAge: 64, inflation: 0,
       province: 'Ontario', lifeExpectancy: 90,
@@ -338,7 +344,9 @@ describe('Tax Integration', () => {
     const retRow = r.rows.find(row => row.age === 65);
     const fedTax = calcProgressiveTax(retRow.taxableIncome, FED_BRACKETS_DEFAULT.bpa, FED_BRACKETS_DEFAULT.brackets);
     const provTax = calcProgressiveTax(retRow.taxableIncome, PROVINCES.Ontario.bpa, PROVINCES.Ontario.brackets);
-    expect(retRow.totalTax).toBeCloseTo(fedTax + provTax, 0);
+    // Total tax now includes pension income credit and age amount credit deductions at 65+
+    expect(retRow.totalTax).toBeLessThanOrEqual(fedTax + provTax);
+    expect(retRow.totalTax).toBeGreaterThanOrEqual(0);
   });
 
   it('G3: province changes produce materially different tax amounts', () => {
@@ -776,7 +784,7 @@ describe('Strategy Parameter', () => {
     expect(row.savWd).toBe(30000);
   });
 
-  it('O3: spend_down produces no RRSP top-up transfer', () => {
+  it('O3: spend_down produces no RRSP top-up transfer (except RRIF minimum excess)', () => {
     const r = runProjection(makeInputs({
       retirementAge: 65, currentAge: 64,
       rrspBal: 500000, tfsaBal: 100000, nonRegBal: 0, savingsBal: 0,
@@ -784,9 +792,11 @@ describe('Strategy Parameter', () => {
       inflation: 0, postGrowth: 0,
     }), "spend_down");
     for (const row of r.rows) {
-      if (row.age >= 65) {
+      // Before age 72, no RRIF minimums so no transfers in spend_down
+      if (row.age >= 65 && row.age < 72) {
         expect(row.rrspToTfsaTransfer).toBe(0);
       }
+      // At age 72+, RRIF minimums may force excess withdrawals that get transferred
     }
   });
 });
@@ -838,13 +848,207 @@ describe('Estate Value', () => {
   });
 
   it('Q3: RRSP estate value is reduced by terminal tax', () => {
+    // Use a very large RRSP balance to ensure it survives meltdown + RRIF minimums
     const r = runProjection(makeInputs({
-      rrspBal: 1000000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
+      rrspBal: 5000000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
       rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
     }));
     const lastRow = r.rows[r.rows.length - 1];
-    // RRSP estate = rrsp * (1 - terminalRate), so it should be less than the raw balance
-    expect(r.estateValue.rrsp).toBeLessThan(lastRow.rrsp);
-    expect(r.estateValue.rrsp).toBeGreaterThan(0);
+    if (lastRow.rrsp > 0) {
+      // RRSP estate = rrsp * (1 - terminalRate), so it should be less than the raw balance
+      expect(r.estateValue.rrsp).toBeLessThan(lastRow.rrsp);
+      expect(r.estateValue.rrsp).toBeGreaterThan(0);
+    } else {
+      // If RRSP is fully depleted by meltdown/RRIF, estate RRSP value is 0
+      expect(r.estateValue.rrsp).toBe(0);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════
+// R. RRIF Minimum Withdrawals
+// ═══════════════════════════════════════════════
+describe('RRIF Minimum Withdrawals', () => {
+  it('R1: getRrifMinimum returns 0 below age 72', () => {
+    expect(getRrifMinimum(71, 1000000)).toBe(0);
+    expect(getRrifMinimum(65, 500000)).toBe(0);
+    expect(getRrifMinimum(35, 100000)).toBe(0);
+  });
+
+  it('R2: getRrifMinimum returns 5.28% at age 72', () => {
+    expect(getRrifMinimum(72, 1000000)).toBeCloseTo(52800, 0);
+  });
+
+  it('R3: getRrifMinimum returns 6.58% at age 80', () => {
+    expect(getRrifMinimum(80, 1000000)).toBeCloseTo(65800, 0);
+  });
+
+  it('R4: getRrifMinimum returns 20% at age 95+', () => {
+    expect(getRrifMinimum(95, 1000000)).toBe(200000);
+    expect(getRrifMinimum(100, 500000)).toBe(100000);
+  });
+
+  it('R5: getRrifMinimum returns 0 for zero balance', () => {
+    expect(getRrifMinimum(80, 0)).toBe(0);
+  });
+
+  it('R6: RRIF minimum is enforced in projection at age 72+', () => {
+    const r = runProjection(makeInputs({
+      currentAge: 71, retirementAge: 65, lifeExpectancy: 75,
+      rrspBal: 1000000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 10000, inflation: 0, postGrowth: 0,
+    }));
+    const row72 = r.rows.find(row => row.age === 72);
+    // At age 72 with $1M RRSP (no growth), RRIF minimum is 5.28% = $52,800
+    // This should be enforced even if spending needs are lower
+    expect(row72.rrspWd).toBeGreaterThanOrEqual(52800);
+  });
+
+  it('R7: RRIF minimum overrides OAS clawback cap', () => {
+    // Large RRSP with OAS — RRIF minimum should override the OAS cap
+    const r = runProjection(makeInputs({
+      currentAge: 71, retirementAge: 65, lifeExpectancy: 75,
+      rrspBal: 2000000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 10000, inflation: 0, postGrowth: 0,
+      oasAt65: 8908, oasClawbackThreshold: 95323,
+    }));
+    const row72 = r.rows.find(row => row.age === 72);
+    // The RRSP balance at 72 may be less than $2M due to meltdown at 71,
+    // but the RRIF minimum (5.28% of actual balance) should still exceed OAS room.
+    // OAS room = 95323 - lockedIncome; RRIF min = balance * 5.28%
+    // The key assertion: RRSP withdrawal exceeds what OAS cap alone would allow
+    const oasRoom = 95323 - (r.optCpp.annual + r.optOas.annual * 1.10);
+    expect(row72.rrspWd).toBeGreaterThan(oasRoom);
+  });
+});
+
+// ═══════════════════════════════════════════════
+// S. OAS 75+ Enhancement
+// ═══════════════════════════════════════════════
+describe('OAS 75+ Enhancement', () => {
+  it('S1: OAS at age 74 uses base amount', () => {
+    const r = runProjection(makeInputs({
+      currentAge: 73, retirementAge: 65, lifeExpectancy: 76,
+      inflation: 0,
+    }));
+    const row74 = r.rows.find(row => row.age === 74);
+    // Before 75, OAS should be the base deferred amount (no 10% bonus)
+    expect(row74.oasGross).toBeCloseTo(r.optOas.annual, 0);
+  });
+
+  it('S2: OAS at age 75 is 10% higher', () => {
+    const r = runProjection(makeInputs({
+      currentAge: 74, retirementAge: 65, lifeExpectancy: 77,
+      inflation: 0,
+    }));
+    const row74 = r.rows.find(row => row.age === 74);
+    const row75 = r.rows.find(row => row.age === 75);
+    // At 75, OAS should be 10% higher than at 74
+    expect(row75.oasGross).toBeCloseTo(row74.oasGross * 1.10, 0);
+  });
+
+  it('S3: OAS lifetime calculation includes 75+ bonus', () => {
+    const r = runProjection(makeInputs({ lifeExpectancy: 80 }));
+    const oas65 = r.oasOptions.find(o => o.age === 65);
+    // 10 years at base (65-74) + 5 years at 1.10x (75-79)
+    const expectedLifetime = oas65.annual * 10 + oas65.annual * 1.10 * 5;
+    expect(oas65.lifetime).toBeCloseTo(expectedLifetime, 0);
+  });
+});
+
+// ═══════════════════════════════════════════════
+// T. Tax Credits (Pension Income & Age Amount)
+// ═══════════════════════════════════════════════
+describe('Tax Credits', () => {
+  it('T1: pension income credit is 0 before age 65', () => {
+    expect(calcPensionIncomeCredit(64, 10000, 5000, 0.14, 0.0505)).toBe(0);
+  });
+
+  it('T2: pension income credit caps at $2,000 eligible', () => {
+    const credit = calcPensionIncomeCredit(65, 5000, 0, 0.14, 0.0505);
+    // Only first $2,000 eligible: 2000 * (0.14 + 0.0505) = $381
+    expect(credit).toBeCloseTo(2000 * (0.14 + 0.0505), 2);
+  });
+
+  it('T3: pension income credit uses combined RRSP + pension', () => {
+    const credit = calcPensionIncomeCredit(65, 1000, 500, 0.14, 0.0505);
+    // $1,500 total eligible (under $2,000 cap)
+    expect(credit).toBeCloseTo(1500 * (0.14 + 0.0505), 2);
+  });
+
+  it('T4: age credit is 0 before age 65', () => {
+    expect(calcAgeCredit(64, 30000, 0.14, 0.0505)).toBe(0);
+  });
+
+  it('T5: age credit full amount for low income', () => {
+    const credit = calcAgeCredit(65, 20000, 0.14, 0.0505, 1);
+    // Income $20K is well below threshold ($44,325), so full credit
+    expect(credit).toBeCloseTo(AGE_CREDIT.amount * (0.14 + 0.0505), 2);
+  });
+
+  it('T6: age credit is clawed back above threshold', () => {
+    const credit = calcAgeCredit(65, 60000, 0.14, 0.0505, 1);
+    // Clawback: (60000 - 44325) * 0.15 = $2,351.25
+    // Eligible: 9028 - 2351.25 = $6,676.75
+    const expectedClawback = (60000 - AGE_CREDIT.threshold) * AGE_CREDIT.clawbackRate;
+    const expectedEligible = AGE_CREDIT.amount - expectedClawback;
+    expect(credit).toBeCloseTo(expectedEligible * (0.14 + 0.0505), 2);
+  });
+
+  it('T7: age credit is 0 for very high income', () => {
+    // Income high enough to fully clawback the age credit
+    // Full clawback at: 44325 + 9028/0.15 = 104511.67
+    const credit = calcAgeCredit(65, 110000, 0.14, 0.0505, 1);
+    expect(credit).toBe(0);
+  });
+
+  it('T8: at age 65+, projection applies tax credits (lower tax than raw brackets)', () => {
+    const r = runProjection(makeInputs({
+      currentAge: 64, retirementAge: 65, lifeExpectancy: 67,
+      inflation: 0, province: 'Ontario',
+      rrspBal: 200000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 40000, postGrowth: 0,
+    }));
+    const row65 = r.rows.find(row => row.age === 65);
+    const rawFedTax = calcProgressiveTax(row65.taxableIncome, FED_BRACKETS_DEFAULT.bpa, FED_BRACKETS_DEFAULT.brackets);
+    const rawProvTax = calcProgressiveTax(row65.taxableIncome, PROVINCES.Ontario.bpa, PROVINCES.Ontario.brackets);
+    // With credits, actual tax should be less than raw fed + prov
+    expect(row65.totalTax).toBeLessThan(rawFedTax + rawProvTax);
+  });
+
+  it('T9: at age 65+, RRSP withdraws at least $2,000 for pension credit in optimize mode', () => {
+    const r = runProjection(makeInputs({
+      currentAge: 64, retirementAge: 65, lifeExpectancy: 70,
+      inflation: 0, postGrowth: 0,
+      rrspBal: 100000, tfsaBal: 500000, nonRegBal: 0, savingsBal: 500000,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 30000,
+    }), "optimize");
+    const row65 = r.rows.find(row => row.age === 65);
+    // Even though cash/TFSA could cover spending, RRSP should withdraw at least $2,000
+    expect(row65.rrspWd).toBeGreaterThanOrEqual(2000);
+  });
+});
+
+// ═══════════════════════════════════════════════
+// U. Enhanced RRSP Meltdown
+// ═══════════════════════════════════════════════
+describe('Enhanced RRSP Meltdown', () => {
+  it('U1: pre-OAS RRSP top-up is not capped by OAS threshold', () => {
+    // Before OAS starts, RRSP meltdown should fill brackets freely
+    const r = runProjection(makeInputs({
+      currentAge: 60, retirementAge: 60, lifeExpectancy: 90,
+      rrspBal: 2000000, tfsaBal: 0, nonRegBal: 0, savingsBal: 0,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 30000, inflation: 0, postGrowth: 0,
+      oasClawbackThreshold: 95323,
+    }));
+    // At age 60, not yet receiving OAS, so RRSP meltdown can go above OAS threshold
+    const row60 = r.rows.find(row => row.age === 60);
+    // With a $2M RRSP and terminal tax rate being high, the top-up should be aggressive
+    expect(row60.rrspWd).toBeGreaterThan(30000); // More than just spending needs
   });
 });

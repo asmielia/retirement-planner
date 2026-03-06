@@ -1,5 +1,6 @@
-import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate } from "./tax.js";
+import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit } from "./tax.js";
 import { runProjection, getSmoothedIncome, getPhaseLabel } from "./projection.js";
+import { getRrifMinimum } from "./constants.js";
 
 // ═══════════════════════════════════════════════
 // COUPLE PROJECTION ENGINE
@@ -80,7 +81,8 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       if (!pAlive) return { cpp: 0, oasGross: 0, pension: 0, bridge: 0, other: 0, employment: 0, total: 0 };
 
       const cpp = pAge >= optCpp.age ? optCpp.annual * infFactor : 0;
-      const oasGross = pAge >= optOas.age ? optOas.annual * infFactor : 0;
+      const oasBase = pAge >= 75 ? optOas.annual * 1.10 : optOas.annual;
+      const oasGross = pAge >= optOas.age ? oasBase * infFactor : 0;
       // Pension starts at the originally planned retirement age (DB pension benefit).
       // Bridge covers gap from originally planned retirement age to 65.
       const pension = pAge >= p.originalRetirementAge ? p.pensionIncome : 0;
@@ -170,9 +172,16 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         rem -= extraRrsp;
       }
 
+      // RRIF minimum: mandatory withdrawal floor at age 72+
+      const personAge = person === you ? youAge : partnerAge;
+      const rrifMin = getRrifMinimum(personAge, rrspAvail);
+      if (rrifMin > rrspWd) {
+        rrspWd = Math.min(rrifMin, rrspAvail);
+      }
+
       // RRSP top-up
       if (strategy === "optimize" || strategy === "max_estate") {
-        const yearsToEnd = person.lifeExpectancy - (person === you ? youAge : partnerAge);
+        const yearsToEnd = person.lifeExpectancy - personAge;
         const currentRrspIncome = lockedIncome + rrspWd;
         const fedBpa = fedBrk.bpa * infFactor;
         const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
@@ -181,6 +190,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrackets, provBpa, provBrackets);
         const rrspAfterWd = rrspAvail - rrspWd;
         const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrk, infFactor);
+        const receivingOas = oasGross > 0;
 
         let extraRrsp = 0;
         if (strategy === "max_estate" && yearsToEnd > 0) {
@@ -202,9 +212,20 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
             }
           }
           extraRrsp = Math.min(extraRrsp, rrspAfterWd);
-          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
-          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+          // Only cap at OAS threshold when receiving OAS — pre-OAS years are the
+          // golden window for aggressive RRSP meltdown with no clawback risk
+          if (receivingOas) {
+            const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+            extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+          }
         }
+
+        // At age 65+, ensure at least $2,000 RRSP withdrawn to capture pension income credit
+        if (personAge >= 65 && rrspWd + extraRrsp < 2000 && rrspAfterWd > 0) {
+          const minForCredit = Math.min(2000 - rrspWd, rrspAfterWd);
+          extraRrsp = Math.max(extraRrsp, minForCredit);
+        }
+
         if (extraRrsp > 0) rrspWd += extraRrsp;
       }
 
@@ -321,29 +342,77 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const provBpa = provData.bpa * infFactor;
     const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
 
-    function computeTax(rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain, oasClawbackThreshold) {
+    function computeTax(rrspWd, cpp, oasGross, pension, bridge, other, nrTaxableGain, oasClawbackThreshold, age) {
       const taxableIncome = rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain;
       const fedTax = calcProgressiveTax(taxableIncome, fedBpa, fedBrackets);
       const provTax = calcProgressiveTax(taxableIncome, provBpa, provBrackets);
-      const totalTax = fedTax + provTax;
+      const fedLowestRate = fedBrackets[0][1];
+      const provLowestRate = provBrackets[0][1];
+      const pensionCredit = calcPensionIncomeCredit(age, rrspWd, pension, fedLowestRate, provLowestRate);
+      const ageCredit = calcAgeCredit(age, taxableIncome, fedLowestRate, provLowestRate, infFactor);
+      const totalTax = Math.max(0, fedTax + provTax - pensionCredit - ageCredit);
       const oasThreshNom = oasClawbackThreshold * infFactor;
       const oasClawback = Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15));
       return { taxableIncome, totalTax, oasClawback };
     }
 
     const yTax = youRetired
-      ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNrTaxableGain, you.oasClawbackThreshold)
+      ? computeTax(yRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNrTaxableGain, you.oasClawbackThreshold, youAge)
       : youAlive && youFixed.employment > 0
         ? (() => { const ti = youFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
         : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
     const pTax = partnerRetired
-      ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNrTaxableGain, partner.oasClawbackThreshold)
+      ? computeTax(pRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNrTaxableGain, partner.oasClawbackThreshold, partnerAge)
       : partnerAlive && partnerFixed.employment > 0
         ? (() => { const ti = partnerFixed.employment; const ft = calcProgressiveTax(ti, fedBpa, fedBrackets); const pt = calcProgressiveTax(ti, provBpa, provBrackets); return { taxableIncome: ti, totalTax: ft + pt, oasClawback: 0 }; })()
         : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
 
-    const totalTax = yTax.totalTax + pTax.totalTax;
-    const totalClawback = yTax.oasClawback + pTax.oasClawback;
+    // ── Pension income splitting (age 65+): up to 50% of eligible income ──
+    // Eligible: RRIF/RRSP withdrawals (at 65+) and pension income
+    let finalYTax = yTax, finalPTax = pTax;
+    if (youRetired && partnerRetired && youAlive && partnerAlive && (youAge >= 65 || partnerAge >= 65)) {
+      const yEligible = (youAge >= 65 ? yRrspWd : 0) + youFixed.pension;
+      const pEligible = (partnerAge >= 65 ? pRrspWd : 0) + partnerFixed.pension;
+
+      // Try splitting from higher-income to lower-income spouse
+      if (yEligible > 0 || pEligible > 0) {
+        const baseCost = yTax.totalTax + yTax.oasClawback + pTax.totalTax + pTax.oasClawback;
+        let bestCost = baseCost;
+
+        // Try splitting from "you" to partner
+        const maxYSplit = yEligible * 0.5;
+        for (let split = 1000; split <= maxYSplit; split += 1000) {
+          const adjYTax = computeTax(yRrspWd - Math.min(split, youAge >= 65 ? yRrspWd : 0), youFixed.cpp, youFixed.oasGross,
+            youFixed.pension - Math.max(0, split - (youAge >= 65 ? yRrspWd : 0)), youFixed.bridge, youFixed.other, yNrTaxableGain, you.oasClawbackThreshold, youAge);
+          const adjPTax = computeTax(pRrspWd + Math.min(split, youAge >= 65 ? yRrspWd : 0), partnerFixed.cpp, partnerFixed.oasGross,
+            partnerFixed.pension + Math.max(0, split - (youAge >= 65 ? yRrspWd : 0)), partnerFixed.bridge, partnerFixed.other, pNrTaxableGain, partner.oasClawbackThreshold, partnerAge);
+          const cost = adjYTax.totalTax + adjYTax.oasClawback + adjPTax.totalTax + adjPTax.oasClawback;
+          if (cost < bestCost) {
+            bestCost = cost;
+            finalYTax = adjYTax;
+            finalPTax = adjPTax;
+          }
+        }
+
+        // Try splitting from partner to "you"
+        const maxPSplit = pEligible * 0.5;
+        for (let split = 1000; split <= maxPSplit; split += 1000) {
+          const adjPTax = computeTax(pRrspWd - Math.min(split, partnerAge >= 65 ? pRrspWd : 0), partnerFixed.cpp, partnerFixed.oasGross,
+            partnerFixed.pension - Math.max(0, split - (partnerAge >= 65 ? pRrspWd : 0)), partnerFixed.bridge, partnerFixed.other, pNrTaxableGain, partner.oasClawbackThreshold, partnerAge);
+          const adjYTax = computeTax(yRrspWd + Math.min(split, partnerAge >= 65 ? pRrspWd : 0), youFixed.cpp, youFixed.oasGross,
+            youFixed.pension + Math.max(0, split - (partnerAge >= 65 ? pRrspWd : 0)), youFixed.bridge, youFixed.other, yNrTaxableGain, you.oasClawbackThreshold, youAge);
+          const cost = adjYTax.totalTax + adjYTax.oasClawback + adjPTax.totalTax + adjPTax.oasClawback;
+          if (cost < bestCost) {
+            bestCost = cost;
+            finalYTax = adjYTax;
+            finalPTax = adjPTax;
+          }
+        }
+      }
+    }
+
+    const totalTax = finalYTax.totalTax + finalPTax.totalTax;
+    const totalClawback = finalYTax.oasClawback + finalPTax.oasClawback;
 
     // Net income: total withdrawals + fixed income - tax - clawback - RRSP top-up transfer
     // (transfer went to TFSA/non-reg and is not spendable cash)
@@ -373,14 +442,14 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         cpp: youFixed.cpp, oasGross: youFixed.oasGross, pension: youFixed.pension, bridge: youFixed.bridge, other: youFixed.other,
         employment: youFixed.employment,
         savWd: ySavWd, nrWd: yNrWd, rrspWd: yRrspWd, tfsaWd: yTfsaWd, rrspToTfsaTransfer: yTransfer,
-        ...yTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - yTax.totalTax - yTax.oasClawback - yTransfer,
+        ...finalYTax, netIncome: ySavWd + yNrWd + yRrspWd + yTfsaWd + youFixed.total - finalYTax.totalTax - finalYTax.oasClawback - yTransfer,
       },
       partner: {
         rrsp: pRrsp, tfsa: pTfsa, nonReg: pNonReg, savings: pSav, totalPortfolio: pPortfolio,
         cpp: partnerFixed.cpp, oasGross: partnerFixed.oasGross, pension: partnerFixed.pension, bridge: partnerFixed.bridge, other: partnerFixed.other,
         employment: partnerFixed.employment,
         savWd: pSavWd, nrWd: pNrWd, rrspWd: pRrspWd, tfsaWd: pTfsaWd, rrspToTfsaTransfer: pTransfer,
-        ...pTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - pTax.totalTax - pTax.oasClawback - pTransfer,
+        ...finalPTax, netIncome: pSavWd + pNrWd + pRrspWd + pTfsaWd + partnerFixed.total - finalPTax.totalTax - finalPTax.oasClawback - pTransfer,
       },
     });
   }

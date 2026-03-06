@@ -1,4 +1,5 @@
-import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate } from "./tax.js";
+import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit } from "./tax.js";
+import { getRrifMinimum } from "./constants.js";
 
 // ═══════════════════════════════════════════════
 // INCOME SMOOTHING
@@ -58,10 +59,13 @@ export function runProjection(inputs, strategy = "optimize") {
   const optCpp = cppOptions.reduce((a, b) => b.lifetime > a.lifetime ? b : a);
 
   // OAS optimization (ages 65-70)
+  // OAS automatically increases 10% at age 75 (since July 2022)
   const oasOptions = [];
   for (let age = 65; age <= 70; age++) {
     let adj = age === 65 ? oasAt65 : oasAt65 * (1 + 0.006 * (age - 65) * 12);
-    const lifetime = adj * Math.max(0, lifeExpectancy - age);
+    const yearsBelow75 = Math.max(0, Math.min(75, lifeExpectancy) - age);
+    const yearsAbove75 = Math.max(0, lifeExpectancy - Math.max(75, age));
+    const lifetime = adj * yearsBelow75 + adj * 1.10 * yearsAbove75;
     oasOptions.push({ age, annual: adj, lifetime });
   }
   const optOas = oasOptions.reduce((a, b) => b.lifetime > a.lifetime ? b : a);
@@ -80,9 +84,10 @@ export function runProjection(inputs, strategy = "optimize") {
     const phase = getPhaseLabel(age, isRetired);
     const growthRate = isRetired ? postGrowth : preGrowth;
 
-    // Government benefits
+    // Government benefits (OAS gets 10% increase at age 75)
     const cpp = age >= optCpp.age ? optCpp.annual * infFactor : 0;
-    const oasGross = age >= optOas.age ? optOas.annual * infFactor : 0;
+    const oasBase = age >= 75 ? optOas.annual * 1.10 : optOas.annual;
+    const oasGross = age >= optOas.age ? oasBase * infFactor : 0;
 
     // Pension starts at the originally planned retirement age (DB pension benefit).
     // Bridge benefit covers the gap from originally planned retirement to age 65.
@@ -173,6 +178,12 @@ export function runProjection(inputs, strategy = "optimize") {
         rem -= extraRrsp;
       }
 
+      // ── RRIF minimum: mandatory withdrawal floor at age 72+ ──
+      const rrifMin = getRrifMinimum(age, rrspAvail);
+      if (rrifMin > rrspWd) {
+        rrspWd = Math.min(rrifMin, rrspAvail);
+      }
+
       // ── RRSP top-up: draw extra RRSP if current marginal rate < terminal rate ──
       if (strategy === "optimize" || strategy === "max_estate") {
         const yearsToEnd = lifeExpectancy - age;
@@ -201,8 +212,18 @@ export function runProjection(inputs, strategy = "optimize") {
             }
           }
           extraRrsp = Math.min(extraRrsp, rrspAfterWd);
-          const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
-          extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+          // Only cap at OAS threshold when receiving OAS — pre-OAS years are the
+          // golden window for aggressive RRSP meltdown with no clawback risk
+          if (receivingOas) {
+            const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+            extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+          }
+        }
+
+        // At age 65+, ensure at least $2,000 RRSP withdrawn to capture pension income credit
+        if (age >= 65 && rrspWd + extraRrsp < 2000 && rrspAfterWd > 0) {
+          const minForCredit = Math.min(2000 - rrspWd, rrspAfterWd);
+          extraRrsp = Math.max(extraRrsp, minForCredit);
         }
 
         if (extraRrsp > 0) {
@@ -257,10 +278,14 @@ export function runProjection(inputs, strategy = "optimize") {
     // because the top-up IS real taxable income that the user pays tax on.
     const taxableIncome = isRetired ? rrspWd + cpp + oasGross + pension + bridge + other + nrTaxableGain : 0;
 
-    // Tax calculation
+    // Tax calculation (with pension income credit and age amount credit at 65+)
     const fedTax = isRetired ? calcProgressiveTax(taxableIncome, fedBpa, fedBrk) : 0;
     const provTax = isRetired ? calcProgressiveTax(taxableIncome, provBpa, provBrk) : 0;
-    const totalTax = fedTax + provTax;
+    const fedLowestRate = fedBrk[0][1];
+    const provLowestRate = provBrk[0][1];
+    const pensionCredit = isRetired ? calcPensionIncomeCredit(age, rrspWd, pension, fedLowestRate, provLowestRate) : 0;
+    const ageCredit = isRetired ? calcAgeCredit(age, taxableIncome, fedLowestRate, provLowestRate, infFactor) : 0;
+    const totalTax = Math.max(0, fedTax + provTax - pensionCredit - ageCredit);
 
     // OAS clawback
     const oasClawback = isRetired ? Math.min(oasGross, Math.max(0, (taxableIncome - oasThreshNom) * 0.15)) : 0;
