@@ -1,4 +1,4 @@
-import { PROVINCES, calcProgressiveTax, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit } from "./tax.js";
+import { PROVINCES, calcProgressiveTax, calcTotalTaxAndClawback, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit } from "./tax.js";
 import { runProjection, getSmoothedIncome, getPhaseLabel } from "./projection.js";
 import { getRrifMinimum } from "./constants.js";
 
@@ -67,6 +67,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const growthRate = anyRetired ? inputs.postGrowth : inputs.preGrowth;
 
     // Desired combined income — smoothed transitions between phases
+    // This is now the NET target (after tax + OAS clawback)
     let desiredBase = 0;
     if (anyRetired) {
       desiredBase = getSmoothedIncome(olderAge, inputs.activeIncome, inputs.slowdownIncome, inputs.inactiveIncome);
@@ -106,7 +107,6 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const partnerFixed = computePersonFixed(partner, partnerAge, partnerAlive, partnerRetired, partnerOptCpp, partnerOptOas);
 
     const combinedFixed = youFixed.total + partnerFixed.total;
-    const portfolioNeed = Math.max(0, desiredNominal - combinedFixed);
 
     // Available balances with growth
     const yRrspAvail = yRrsp * (1 + growthRate);
@@ -122,13 +122,20 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const pTotal = pRrspAvail + pTfsaAvail + pNonRegAvail + pSavAvail;
     const combinedTotal = yTotal + pTotal;
 
+    // Compute non-reg capital gain fractions BEFORE withdrawals
+    const yNrGainFrac = yNonRegAvail > 0 ? Math.max(0, 1 - yNonRegCostBasis / yNonRegAvail) : 0;
+    const pNrGainFrac = pNonRegAvail > 0 ? Math.max(0, 1 - pNonRegCostBasis / pNonRegAvail) : 0;
+
     let ySavWd = 0, yNrWd = 0, yRrspWd = 0, yTfsaWd = 0;
     let pSavWd = 0, pNrWd = 0, pRrspWd = 0, pTfsaWd = 0;
+    let grossNominal = 0;
 
-    function allocateWithdrawals(need, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, oasGross, person, alive, retired) {
+    // Spending-only withdrawal allocation (no RRSP top-up)
+    function allocateSpendingWithdrawals(need, grossTarget, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, oasGross, alive, retired) {
       if (!alive || !retired || need <= 0) return { savWd: 0, nrWd: 0, rrspWd: 0, tfsaWd: 0 };
 
-      const cashFloor = strategy === "spend_down" ? 0 : (desiredNominal / 12) * 2 * (need / Math.max(1, portfolioNeed));
+      const portfolioNeed = Math.max(0, grossTarget - combinedFixed);
+      const cashFloor = strategy === "spend_down" ? 0 : (grossTarget / 12) * 2 * (need / Math.max(1, portfolioNeed));
       const savAvailAfterFloor = Math.max(0, savAvail - cashFloor);
       let savWd = Math.min(savAvailAfterFloor, need);
       let rem = need - savWd;
@@ -137,7 +144,6 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       let rrspWd, nrWd, tfsaWd;
 
       if (receivingOas) {
-        // OAS-aware order: RRSP (capped) → Non-reg → TFSA
         const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
         rrspWd = Math.min(rrspAvail, rem, rrspRoom);
         rem -= rrspWd;
@@ -148,7 +154,6 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         tfsaWd = Math.min(tfsaAvail, rem);
         rem -= tfsaWd;
       } else {
-        // Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA
         rrspWd = Math.min(rrspAvail, rem);
         rem -= rrspWd;
 
@@ -165,109 +170,180 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         rem -= extraSav;
       }
 
-      // If still short (OAS mode cap), pull more RRSP beyond OAS cap.
       if (rem > 0) {
         const extraRrsp = Math.min(rrspAvail - rrspWd, rem);
         rrspWd += extraRrsp;
         rem -= extraRrsp;
       }
 
-      // RRIF minimum: mandatory withdrawal floor at age 72+
-      const personAge = person === you ? youAge : partnerAge;
-      const rrifMin = getRrifMinimum(personAge, rrspAvail);
-      if (rrifMin > rrspWd) {
-        rrspWd = Math.min(rrifMin, rrspAvail);
-      }
+      return { savWd, nrWd, rrspWd, tfsaWd };
+    }
 
-      // RRSP top-up
-      if (strategy === "optimize" || strategy === "max_estate") {
-        const yearsToEnd = person.lifeExpectancy - personAge;
-        const currentRrspIncome = lockedIncome + rrspWd;
-        const fedBpa = fedBrk.bpa * infFactor;
-        const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
-        const provBpa = provData.bpa * infFactor;
-        const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
-        const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrackets, provBpa, provBrackets);
-        const rrspAfterWd = rrspAvail - rrspWd;
-        const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrk, infFactor);
+    // RRSP top-up (separate from spending allocation)
+    function applyRrspTopUp(rrspWd, rrspAvail, lockedIncome, oasThreshNom, person, personAge, oasGross) {
+      if (strategy !== "optimize" && strategy !== "max_estate") return 0;
+
+      const yearsToEnd = person.lifeExpectancy - personAge;
+      const currentRrspIncome = lockedIncome + rrspWd;
+      const fedBpa = fedBrk.bpa * infFactor;
+      const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
+      const provBpa = provData.bpa * infFactor;
+      const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
+      const currentMarginal = getCombinedMarginalRate(currentRrspIncome, fedBpa, fedBrackets, provBpa, provBrackets);
+      const rrspAfterWd = rrspAvail - rrspWd;
+      const terminalRate = estimateTerminalTaxRate(rrspAfterWd, provData, fedBrk, infFactor);
+
+      let extraRrsp = 0;
+      if (strategy === "max_estate" && yearsToEnd > 0) {
+        const annualTarget = rrspAfterWd / yearsToEnd;
+        extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
+        const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
+        extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
+      } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
+        let testIncome = currentRrspIncome;
+        for (const [threshold] of fedBrackets) {
+          const bracketEdge = threshold;
+          if (bracketEdge > testIncome) {
+            const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrackets, provBpa, provBrackets);
+            if (rateAtEdge >= terminalRate) {
+              extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
+              break;
+            }
+            testIncome = bracketEdge;
+          }
+        }
+        extraRrsp = Math.min(extraRrsp, rrspAfterWd);
+        // Only cap at OAS threshold when receiving OAS — pre-OAS years are the
+        // golden window for aggressive RRSP meltdown with no clawback risk
         const receivingOas = oasGross > 0;
-
-        let extraRrsp = 0;
-        if (strategy === "max_estate" && yearsToEnd > 0) {
-          const annualTarget = rrspAfterWd / yearsToEnd;
-          extraRrsp = Math.min(rrspAfterWd, Math.max(0, annualTarget - rrspWd));
+        if (receivingOas) {
           const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
           extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
-        } else if (currentMarginal < terminalRate && rrspAfterWd > 0) {
-          let testIncome = currentRrspIncome;
-          for (const [threshold] of fedBrackets) {
-            const bracketEdge = threshold;
-            if (bracketEdge > testIncome) {
-              const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrackets, provBpa, provBrackets);
-              if (rateAtEdge >= terminalRate) {
-                extraRrsp = Math.max(0, bracketEdge - currentRrspIncome);
-                break;
-              }
-              testIncome = bracketEdge;
-            }
-          }
-          extraRrsp = Math.min(extraRrsp, rrspAfterWd);
-          // Only cap at OAS threshold when receiving OAS — pre-OAS years are the
-          // golden window for aggressive RRSP meltdown with no clawback risk
-          if (receivingOas) {
-            const maxRrspForOas = Math.max(0, oasThreshNom - lockedIncome);
-            extraRrsp = Math.max(0, Math.min(extraRrsp, maxRrspForOas - rrspWd));
-          }
         }
-
-        // At age 65+, ensure at least $2,000 RRSP withdrawn to capture pension income credit
-        if (personAge >= 65 && rrspWd + extraRrsp < 2000 && rrspAfterWd > 0) {
-          const minForCredit = Math.min(2000 - rrspWd, rrspAfterWd);
-          extraRrsp = Math.max(extraRrsp, minForCredit);
-        }
-
-        if (extraRrsp > 0) rrspWd += extraRrsp;
       }
 
-      return { savWd, nrWd, rrspWd, tfsaWd };
+      // At age 65+, ensure at least $2,000 RRSP withdrawn to capture pension income credit
+      if (personAge >= 65 && rrspWd + extraRrsp < 2000 && rrspAfterWd > 0) {
+        const minForCredit = Math.min(2000 - rrspWd, rrspAfterWd);
+        extraRrsp = Math.max(extraRrsp, minForCredit);
+      }
+
+      return extraRrsp;
     }
 
     if (youRetired || partnerRetired) {
       const youCanWithdraw = youAlive && youRetired;
       const partnerCanWithdraw = partnerAlive && partnerRetired;
 
-      if (youCanWithdraw && partnerCanWithdraw) {
-        const youShare = combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
-        const partnerShare = combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
+      const yOasThresh = you.oasClawbackThreshold * infFactor;
+      const pOasThresh = partner.oasClawbackThreshold * infFactor;
+      const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
+      const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
 
-        const yOasThresh = you.oasClawbackThreshold * infFactor;
-        const pOasThresh = partner.oasClawbackThreshold * infFactor;
-        const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
-        const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
+      // Tax bracket info for this year
+      const fedBpa = fedBrk.bpa * infFactor;
+      const fedBrackets = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
+      const provBpa = provData.bpa * infFactor;
+      const provBrackets = provData.brackets.map(([t, r]) => [t * infFactor, r]);
 
-        const yWd = allocateWithdrawals(youShare, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, you, youAlive, youRetired);
-        const pWd = allocateWithdrawals(partnerShare, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partner, partnerAlive, partnerRetired);
+      // ── Iterative net-income targeting ──
+      let grossEstimate = desiredNominal;
 
+      for (let iter = 0; iter < 10; iter++) {
+        const portfolioNeed = Math.max(0, grossEstimate - combinedFixed);
+
+        let yWd = { savWd: 0, nrWd: 0, rrspWd: 0, tfsaWd: 0 };
+        let pWd = { savWd: 0, nrWd: 0, rrspWd: 0, tfsaWd: 0 };
+
+        if (youCanWithdraw && partnerCanWithdraw) {
+          const youShare = combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
+          const partnerShare = combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
+          yWd = allocateSpendingWithdrawals(youShare, grossEstimate, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, youAlive, youRetired);
+          pWd = allocateSpendingWithdrawals(partnerShare, grossEstimate, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partnerAlive, partnerRetired);
+        } else if (youCanWithdraw) {
+          yWd = allocateSpendingWithdrawals(portfolioNeed, grossEstimate, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, youAlive, youRetired);
+        } else if (partnerCanWithdraw) {
+          pWd = allocateSpendingWithdrawals(portfolioNeed, grossEstimate, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partnerAlive, partnerRetired);
+        }
+
+        // Compute per-person RRSP top-up inside iteration so its tax impact is accounted for
+        const yNrTaxGain = yWd.nrWd * yNrGainFrac * 0.5;
+        const pNrTaxGain = pWd.nrWd * pNrGainFrac * 0.5;
+
+        const yTopUp = youCanWithdraw ? applyRrspTopUp(yWd.rrspWd, yRrspAvail, yLocked, yOasThresh, you, youAge, youFixed.oasGross) : 0;
+        const pTopUp = partnerCanWithdraw ? applyRrspTopUp(pWd.rrspWd, pRrspAvail, pLocked, pOasThresh, partner, partnerAge, partnerFixed.oasGross) : 0;
+
+        // Recompute tax with spending + top-up combined
+        const yFinalRrspWd = yWd.rrspWd + yTopUp;
+        const pFinalRrspWd = pWd.rrspWd + pTopUp;
+
+        const yTaxResult = youRetired
+          ? calcTotalTaxAndClawback(yFinalRrspWd, youFixed.cpp, youFixed.oasGross, youFixed.pension, youFixed.bridge, youFixed.other, yNrTaxGain, fedBpa, fedBrackets, provBpa, provBrackets, yOasThresh)
+          : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+        const pTaxResult = partnerRetired
+          ? calcTotalTaxAndClawback(pFinalRrspWd, partnerFixed.cpp, partnerFixed.oasGross, partnerFixed.pension, partnerFixed.bridge, partnerFixed.other, pNrTaxGain, fedBpa, fedBrackets, provBpa, provBrackets, pOasThresh)
+          : { taxableIncome: 0, totalTax: 0, oasClawback: 0 };
+
+        // Apply tax credits to iteration tax computation
+        const iterFedLowest = fedBrackets[0][1];
+        const iterProvLowest = provBrackets[0][1];
+        const yIterPensionCredit = youRetired ? calcPensionIncomeCredit(youAge, yFinalRrspWd, youFixed.pension, iterFedLowest, iterProvLowest) : 0;
+        const yIterAgeCredit = youRetired ? calcAgeCredit(youAge, yTaxResult.taxableIncome, iterFedLowest, iterProvLowest, infFactor) : 0;
+        const pIterPensionCredit = partnerRetired ? calcPensionIncomeCredit(partnerAge, pFinalRrspWd, partnerFixed.pension, iterFedLowest, iterProvLowest) : 0;
+        const pIterAgeCredit = partnerRetired ? calcAgeCredit(partnerAge, pTaxResult.taxableIncome, iterFedLowest, iterProvLowest, infFactor) : 0;
+        const combinedTax = Math.max(0, yTaxResult.totalTax - yIterPensionCredit - yIterAgeCredit) + Math.max(0, pTaxResult.totalTax - pIterPensionCredit - pIterAgeCredit);
+        const combinedClawback = yTaxResult.oasClawback + pTaxResult.oasClawback;
+        // Net = spending withdrawals + fixed income - full tax (with credits) - clawback
+        const yTotalWd = yWd.savWd + yWd.nrWd + yWd.rrspWd + yWd.tfsaWd;
+        const pTotalWd = pWd.savWd + pWd.nrWd + pWd.rrspWd + pWd.tfsaWd;
+        const iterNet = yTotalWd + pTotalWd + combinedFixed - combinedTax - combinedClawback;
+
+        const gap = desiredNominal - iterNet;
+        if (Math.abs(gap) < 1.0) {
+          ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
+          pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
+          grossNominal = grossEstimate;
+          break;
+        }
+
+        // Store latest result in case we hit max iterations
         ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
         pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
-      } else if (youCanWithdraw) {
-        const yOasThresh = you.oasClawbackThreshold * infFactor;
-        const yLocked = youFixed.cpp + youFixed.oasGross + youFixed.pension + youFixed.bridge + youFixed.other;
-        const yWd = allocateWithdrawals(portfolioNeed, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, you, youAlive, youRetired);
-        ySavWd = yWd.savWd; yNrWd = yWd.nrWd; yRrspWd = yWd.rrspWd; yTfsaWd = yWd.tfsaWd;
-      } else if (partnerCanWithdraw) {
-        const pOasThresh = partner.oasClawbackThreshold * infFactor;
-        const pLocked = partnerFixed.cpp + partnerFixed.oasGross + partnerFixed.pension + partnerFixed.bridge + partnerFixed.other;
-        const pWd = allocateWithdrawals(portfolioNeed, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partner, partnerAlive, partnerRetired);
-        pSavWd = pWd.savWd; pNrWd = pWd.nrWd; pRrspWd = pWd.rrspWd; pTfsaWd = pWd.tfsaWd;
+        grossNominal = grossEstimate;
+
+        grossEstimate += gap;
+      }
+
+      // RRIF minimum: mandatory withdrawal floor at age 72+
+      if (youCanWithdraw) {
+        const yRrifMin = getRrifMinimum(youAge, yRrspAvail);
+        if (yRrifMin > yRrspWd) yRrspWd = Math.min(yRrifMin, yRrspAvail);
+      }
+      if (partnerCanWithdraw) {
+        const pRrifMin = getRrifMinimum(partnerAge, pRrspAvail);
+        if (pRrifMin > pRrspWd) pRrspWd = Math.min(pRrifMin, pRrspAvail);
+      }
+
+      // Apply RRSP top-up after iteration converges (tax optimization, not spending)
+      if (youCanWithdraw) {
+        const extraYRrsp = applyRrspTopUp(yRrspWd, yRrspAvail, yLocked, yOasThresh, you, youAge, youFixed.oasGross);
+        if (extraYRrsp > 0) yRrspWd += extraYRrsp;
+      }
+      if (partnerCanWithdraw) {
+        const extraPRrsp = applyRrspTopUp(pRrspWd, pRrspAvail, pLocked, pOasThresh, partner, partnerAge, partnerFixed.oasGross);
+        if (extraPRrsp > 0) pRrspWd += extraPRrsp;
       }
     }
 
-    // Compute non-reg capital gain fractions BEFORE updating cost basis
-    const yNrGainFrac = yNonRegAvail > 0 ? Math.max(0, 1 - yNonRegCostBasis / yNonRegAvail) : 0;
-    const pNrGainFrac = pNonRegAvail > 0 ? Math.max(0, 1 - pNonRegCostBasis / pNonRegAvail) : 0;
+    // Recompute non-reg taxable gains with final withdrawals
     const yNrTaxableGain = yNrWd * yNrGainFrac * 0.5;
     const pNrTaxableGain = pNrWd * pNrGainFrac * 0.5;
+
+    // Track RRSP→TFSA rebalance per partner (not spendable income)
+    const portfolioNeed = Math.max(0, grossNominal - combinedFixed);
+    const yTransfer = youRetired ? Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0)) : 0;
+    const pTransfer = partnerRetired ? Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0)) : 0;
+    const totalTransfer = yTransfer + pTransfer;
 
     // Update balances — RRSP top-up excess goes to TFSA (up to contribution room), overflow to non-reg
     // TFSA contribution room: $7K/year per person accrues, withdrawals restore room
@@ -329,11 +405,6 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     const yPortfolio = yRrsp + yTfsa + yNonReg + ySav;
     const pPortfolio = pRrsp + pTfsa + pNonReg + pSav;
     const totalPortfolio = yPortfolio + pPortfolio;
-
-    // Track RRSP→TFSA rebalance per partner (not spendable income) — compute BEFORE tax
-    const yTransfer = youRetired ? Math.max(0, (ySavWd + yNrWd + yRrspWd + yTfsaWd) - (combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : 0)) : 0;
-    const pTransfer = partnerRetired ? Math.max(0, (pSavWd + pNrWd + pRrspWd + pTfsaWd) - (combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : 0)) : 0;
-    const totalTransfer = yTransfer + pTransfer;
 
     // Tax per person — computed on full RRSP withdrawal (including top-up rebalance),
     // because the top-up IS real taxable income that the user pays tax on.
@@ -434,7 +505,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       rrspToTfsaTransfer: totalTransfer,
       taxableIncome: yTax.taxableIncome + pTax.taxableIncome,
       totalTax, oasClawback: totalClawback, netIncome,
-      desiredNominal,
+      desiredNominal, grossNominal,
       realPortfolio: totalPortfolio / infFactor,
       contribution: (!youRetired || !partnerRetired) ? (youAlive && !youRetired ? you.rrspContrib + you.tfsaContrib + you.nonRegContrib + you.savingsContrib : 0) + (partnerAlive && !partnerRetired ? partner.rrspContrib + partner.tfsaContrib + partner.nonRegContrib + partner.savingsContrib : 0) : 0,
       you: {

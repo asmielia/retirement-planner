@@ -1,5 +1,6 @@
 import { SectionTitle, TextField, Field, Explanation, SelectField } from "../components.jsx";
 import { PROVINCES } from "../tax.js";
+import T4UploadButton from "../T4UploadButton.jsx";
 
 export default function Page1_Personal({ inputs, setField, personTab, isCouple, activePerson, activeSetField, names }) {
   const who = isCouple ? (personTab === "partner" ? names.partnerPossessive : names.youPossessive) : names.youPossessive;
@@ -46,6 +47,7 @@ export default function Page1_Personal({ inputs, setField, personTab, isCouple, 
           <Field label={`${who} Desired Retirement Age`} value={activePerson.retirementAge} onChange={v => activeSetField("retirementAge", v)} type="number" min={50} max={75} hint="When do you want to stop working?" />
           <Field label={`${who} Life Expectancy`} value={activePerson.lifeExpectancy} onChange={v => activeSetField("lifeExpectancy", v)} type="number" min={70} max={105} hint="Plan conservatively — the average Canadian lives to 82" />
           <Field label={`${who} Employment Income (Today's $)`} value={activePerson.employmentIncome} onChange={v => activeSetField("employmentIncome", v)} hint="Current annual salary or self-employment income" />
+          <T4UploadButton onIncomeExtracted={(val) => activeSetField("employmentIncome", val)} />
         </div>
         <div>
           {/* Province is shared — only show on "You" tab */}
