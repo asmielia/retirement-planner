@@ -1053,7 +1053,37 @@ describe('Enhanced RRSP Meltdown', () => {
     expect(row60.rrspWd).toBeGreaterThan(30000); // More than just spending needs
   });
 
-  it('U2: large RRSP meltdown does not withdraw entire balance (infinity bracket bug)', () => {
+  it('U2: optimize strategy uses proportional allocation across account types', () => {
+    // With balanced portfolio, optimize should draw from all three account types
+    // proportionally by balance, not sequentially (RRSP first)
+    const r = runProjection(makeInputs({
+      currentAge: 60, retirementAge: 60, lifeExpectancy: 90,
+      rrspBal: 300000, tfsaBal: 300000, nonRegBal: 300000, savingsBal: 0,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 60000, inflation: 0, postGrowth: 0,
+    }), "optimize");
+    const row60 = r.rows.find(row => row.age === 60);
+    // All three accounts should be drawn from (proportional, not sequential)
+    expect(row60.rrspWd).toBeGreaterThan(0);
+    expect(row60.nrWd).toBeGreaterThan(0);
+    expect(row60.tfsaWd).toBeGreaterThan(0);
+  });
+
+  it('U3: spend_down still uses sequential allocation (RRSP first)', () => {
+    // spend_down should maintain the old sequential behavior
+    const r = runProjection(makeInputs({
+      currentAge: 60, retirementAge: 60, lifeExpectancy: 90,
+      rrspBal: 300000, tfsaBal: 300000, nonRegBal: 300000, savingsBal: 0,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 60000, inflation: 0, postGrowth: 0,
+    }), "spend_down");
+    const row60 = r.rows.find(row => row.age === 60);
+    // Sequential: RRSP covers full spending need, TFSA should be 0
+    expect(row60.rrspWd).toBeGreaterThan(0);
+    expect(row60.tfsaWd).toBe(0);
+  });
+
+  it('U4: large RRSP meltdown does not withdraw entire balance (infinity bracket bug)', () => {
     // Regression: bracket-filling loop previously reached Infinity threshold,
     // causing extraRrsp = Infinity - currentIncome = entire RRSP balance
     const r = runProjection(makeInputs({

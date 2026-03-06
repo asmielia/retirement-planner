@@ -48,8 +48,23 @@ function computeWithdrawalsAndTax(grossTarget, {
   const receivingOas = oasGross > 0;
   let rrspWd, nrWd, tfsaWd;
 
-  if (receivingOas) {
-    // OAS-aware order: RRSP (capped) → Non-reg → TFSA
+  if (strategy !== "spend_down") {
+    // Proportional by balance: spread spending across RRSP, Non-Reg, TFSA
+    // to smooth taxable income across retirement years
+    const rrspEffective = receivingOas
+      ? Math.min(rrspAvail, Math.max(0, oasThreshNom - lockedIncome))
+      : rrspAvail;
+    const totalAvail = rrspEffective + nonRegAvail + tfsaAvail;
+    if (totalAvail > 0 && rem > 0) {
+      rrspWd = Math.min(rrspEffective, Math.round(rem * rrspEffective / totalAvail));
+      nrWd = Math.min(nonRegAvail, Math.round(rem * nonRegAvail / totalAvail));
+      tfsaWd = Math.min(tfsaAvail, rem - rrspWd - nrWd);
+      rem -= (rrspWd + nrWd + tfsaWd);
+    } else {
+      rrspWd = 0; nrWd = 0; tfsaWd = 0;
+    }
+  } else if (receivingOas) {
+    // OAS-aware sequential: RRSP (capped) → Non-reg → TFSA
     const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
     rrspWd = Math.min(rrspAvail, rem, rrspRoom);
     rem -= rrspWd;
@@ -60,7 +75,7 @@ function computeWithdrawalsAndTax(grossTarget, {
     tfsaWd = Math.min(tfsaAvail, rem);
     rem -= tfsaWd;
   } else {
-    // Pre-OAS order: RRSP (uncapped) → Non-reg → TFSA
+    // Pre-OAS sequential: RRSP (uncapped) → Non-reg → TFSA
     rrspWd = Math.min(rrspAvail, rem);
     rem -= rrspWd;
 
