@@ -777,11 +777,9 @@ describe('Strategy Parameter', () => {
       rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
     }), "optimize");
     const row = r.rows.find(row => row.age === 65);
-    // With net-income targeting + RRSP top-up inside iteration:
-    // grossEstimate rises to cover tax on RRSP top-up. Tax credits (pension + age at 65+)
-    // reduce the gross needed. savWd should be positive and significant.
-    expect(row.savWd).toBeGreaterThan(40000);
-    expect(row.savWd).toBeLessThan(55000);
+    // With temporal cap on RRSP meltdown ($100K / 25yrs = $4K/yr top-up),
+    // gross stays close to desired and savWd covers spending from cash.
+    expect(row.savWd).toBe(30000);
     // Verify cash floor is reserved: remaining savings >= cashFloor
     const cashFloor = (row.grossNominal / 12) * 2;
     expect(100000 - row.savWd).toBeGreaterThanOrEqual(cashFloor - 1);
