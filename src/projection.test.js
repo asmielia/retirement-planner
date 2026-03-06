@@ -1054,6 +1054,26 @@ describe('Enhanced RRSP Meltdown', () => {
     // With a $2M RRSP and terminal tax rate being high, the top-up should be aggressive
     expect(row60.rrspWd).toBeGreaterThan(30000); // More than just spending needs
   });
+
+  it('U2: large RRSP meltdown does not withdraw entire balance (infinity bracket bug)', () => {
+    // Regression: bracket-filling loop previously reached Infinity threshold,
+    // causing extraRrsp = Infinity - currentIncome = entire RRSP balance
+    const r = runProjection(makeInputs({
+      currentAge: 60, retirementAge: 60, lifeExpectancy: 90,
+      rrspBal: 2000000, tfsaBal: 200000, nonRegBal: 0, savingsBal: 50000,
+      rrspContrib: 0, tfsaContrib: 0, nonRegContrib: 0, savingsContrib: 0,
+      activeIncome: 80000, inflation: 0, postGrowth: 0.04,
+      pensionIncome: 0, pensionBridge: 0, otherIncome: 0,
+    }));
+    const row60 = r.rows.find(row => row.age === 60);
+    // RRSP meltdown should fill to last finite bracket edge, not withdraw entire $2M
+    // Last federal bracket edge is ~$258K — with BPA and spending, top-up should be well under $500K
+    expect(row60.rrspWd).toBeLessThan(500000);
+    // Net income should not be negative
+    expect(row60.netIncome).toBeGreaterThan(0);
+    // Portfolio should still have substantial funds
+    expect(row60.totalPortfolio).toBeGreaterThan(1000000);
+  });
 });
 
 // ═══════════════════════════════════════════════

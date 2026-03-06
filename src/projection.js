@@ -233,6 +233,11 @@ export function runProjection(inputs, strategy = "optimize") {
               let testIncome = currentRrspIncome;
               for (const [threshold] of fedBrk) {
                 const bracketEdge = threshold;
+                if (!isFinite(bracketEdge)) {
+                  // Top bracket rate equals terminal rate — fill to last finite edge only
+                  topUpRrsp = Math.max(0, testIncome - currentRrspIncome);
+                  break;
+                }
                 if (bracketEdge > testIncome) {
                   const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
                   if (rateAtEdge >= terminalRate) {
@@ -302,6 +307,11 @@ export function runProjection(inputs, strategy = "optimize") {
             let testIncome = currentRrspIncome;
             for (const [threshold] of fedBrk) {
               const bracketEdge = threshold;
+              if (!isFinite(bracketEdge)) {
+                // Top bracket rate equals terminal rate — fill to last finite edge only
+                extraRrsp = Math.max(0, testIncome - currentRrspIncome);
+                break;
+              }
               if (bracketEdge > testIncome) {
                 const rateAtEdge = getCombinedMarginalRate(bracketEdge, fedBpa, fedBrk, provBpa, provBrk);
                 if (rateAtEdge >= terminalRate) {
