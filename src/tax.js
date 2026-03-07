@@ -81,6 +81,21 @@ export function calcTotalTaxAndClawback(
   return { taxableIncome, totalTax, oasClawback };
 }
 
+export function getIncomeForAvgTaxRate(targetRate, fedBpa, fedBrk, provBpa, provBrk) {
+  // Binary search for the income level at which the average combined
+  // (federal + provincial) tax rate equals targetRate.
+  // Progressive tax makes avg rate monotonically increasing, so binary search works.
+  let lo = 0, hi = 2000000;
+  for (let i = 0; i < 50; i++) {
+    const mid = (lo + hi) / 2;
+    const tax = calcProgressiveTax(mid, fedBpa, fedBrk) + calcProgressiveTax(mid, provBpa, provBrk);
+    const avgRate = mid > 0 ? tax / mid : 0;
+    if (avgRate < targetRate) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
 export function estimateTerminalTaxRate(rrspBal, provData, fedBrackets, infFactor) {
   // At death the full RRSP balance is deemed taxable income
   const fedBpa = fedBrackets.bpa * infFactor;

@@ -1,4 +1,4 @@
-import { PROVINCES, calcProgressiveTax, calcTotalTaxAndClawback, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit } from "./tax.js";
+import { PROVINCES, calcProgressiveTax, calcTotalTaxAndClawback, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit, getIncomeForAvgTaxRate } from "./tax.js";
 import { getRrifMinimum } from "./constants.js";
 
 // ═══════════════════════════════════════════════
@@ -49,20 +49,28 @@ function computeWithdrawalsAndTax(grossTarget, {
   let rrspWd, nrWd, tfsaWd;
 
   if (strategy !== "spend_down") {
-    // Proportional by balance: spread spending across RRSP, Non-Reg, TFSA
-    // to smooth taxable income across retirement years
-    const rrspEffective = receivingOas
-      ? Math.min(rrspAvail, Math.max(0, oasThreshNom - lockedIncome))
-      : rrspAvail;
-    const totalAvail = rrspEffective + nonRegAvail + tfsaAvail;
-    if (totalAvail > 0 && rem > 0) {
-      rrspWd = Math.min(rrspEffective, Math.round(rem * rrspEffective / totalAvail));
-      nrWd = Math.min(nonRegAvail, Math.round(rem * nonRegAvail / totalAvail));
-      tfsaWd = Math.min(tfsaAvail, rem - rrspWd - nrWd);
-      rem -= (rrspWd + nrWd + tfsaWd);
-    } else {
-      rrspWd = 0; nrWd = 0; tfsaWd = 0;
-    }
+    // Sequential with tax smoothing: Non-Reg → RRSP (tax-smoothed) → TFSA
+    // Non-reg is drawn first (only capital gains portion taxable).
+    // RRSP fills up to the income level where avg tax rate ≈ 30%.
+    // Above that soft threshold, TFSA is preferred to keep avg rate down.
+    // The 30% is NOT a ceiling — the existing fallback pulls more RRSP
+    // if TFSA + Non-Reg can't cover spending.
+    nrWd = Math.min(nonRegAvail, rem);
+    rem -= nrWd;
+
+    const nrTaxGain = nrWd * nrGainFraction * 0.5;
+    const incomeAlready = lockedIncome + nrTaxGain;
+    const targetTaxableIncome = getIncomeForAvgTaxRate(0.30, fedBpa, fedBrk, provBpa, provBrk);
+    const rrspTaxRoom = Math.max(0, targetTaxableIncome - incomeAlready);
+    const rrspOasCap = receivingOas
+      ? Math.max(0, oasThreshNom - lockedIncome)
+      : Infinity;
+    const rrspPreferred = Math.min(rrspTaxRoom, rrspOasCap);
+    rrspWd = Math.min(rrspAvail, rem, rrspPreferred);
+    rem -= rrspWd;
+
+    tfsaWd = Math.min(tfsaAvail, rem);
+    rem -= tfsaWd;
   } else if (receivingOas) {
     // OAS-aware sequential: RRSP (capped) → Non-reg → TFSA
     const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
