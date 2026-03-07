@@ -1,4 +1,4 @@
-import { PROVINCES, calcProgressiveTax, calcTotalTaxAndClawback, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit } from "./tax.js";
+import { PROVINCES, calcProgressiveTax, calcTotalTaxAndClawback, getCombinedMarginalRate, estimateTerminalTaxRate, calcPensionIncomeCredit, calcAgeCredit, getIncomeForAvgTaxRate } from "./tax.js";
 import { runProjection, getSmoothedIncome, getPhaseLabel } from "./projection.js";
 import { getRrifMinimum } from "./constants.js";
 
@@ -131,7 +131,7 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
     let grossNominal = 0;
 
     // Spending-only withdrawal allocation (no RRSP top-up)
-    function allocateSpendingWithdrawals(need, grossTarget, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, oasGross, alive, retired) {
+    function allocateSpendingWithdrawals(need, grossTarget, rrspAvail, tfsaAvail, nonRegAvail, savAvail, oasThreshNom, lockedIncome, oasGross, alive, retired, nrGainFraction) {
       if (!alive || !retired || need <= 0) return { savWd: 0, nrWd: 0, rrspWd: 0, tfsaWd: 0 };
 
       const portfolioNeed = Math.max(0, grossTarget - combinedFixed);
@@ -144,19 +144,27 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
       let rrspWd, nrWd, tfsaWd;
 
       if (strategy !== "spend_down") {
-        // Proportional by balance: spread spending across RRSP, Non-Reg, TFSA
-        const rrspEffective = receivingOas
-          ? Math.min(rrspAvail, Math.max(0, oasThreshNom - lockedIncome))
-          : rrspAvail;
-        const totalAvail = rrspEffective + nonRegAvail + tfsaAvail;
-        if (totalAvail > 0 && rem > 0) {
-          rrspWd = Math.min(rrspEffective, Math.round(rem * rrspEffective / totalAvail));
-          nrWd = Math.min(nonRegAvail, Math.round(rem * nonRegAvail / totalAvail));
-          tfsaWd = Math.min(tfsaAvail, rem - rrspWd - nrWd);
-          rem -= (rrspWd + nrWd + tfsaWd);
-        } else {
-          rrspWd = 0; nrWd = 0; tfsaWd = 0;
-        }
+        // Sequential with tax smoothing: Non-Reg → RRSP (tax-smoothed) → TFSA
+        nrWd = Math.min(nonRegAvail, rem);
+        rem -= nrWd;
+
+        const nrTaxGain = nrWd * (nrGainFraction || 0) * 0.5;
+        const incomeAlready = lockedIncome + nrTaxGain;
+        const iFedBpa = fedBrk.bpa * infFactor;
+        const iFedBrk = fedBrk.brackets.map(([t, r]) => [t * infFactor, r]);
+        const iProvBpa = provData.bpa * infFactor;
+        const iProvBrk = provData.brackets.map(([t, r]) => [t * infFactor, r]);
+        const targetTaxableIncome = getIncomeForAvgTaxRate(0.30, iFedBpa, iFedBrk, iProvBpa, iProvBrk);
+        const rrspTaxRoom = Math.max(0, targetTaxableIncome - incomeAlready);
+        const rrspOasCap = receivingOas
+          ? Math.max(0, oasThreshNom - lockedIncome)
+          : Infinity;
+        const rrspPreferred = Math.min(rrspTaxRoom, rrspOasCap);
+        rrspWd = Math.min(rrspAvail, rem, rrspPreferred);
+        rem -= rrspWd;
+
+        tfsaWd = Math.min(tfsaAvail, rem);
+        rem -= tfsaWd;
       } else if (receivingOas) {
         const rrspRoom = Math.max(0, oasThreshNom - lockedIncome);
         rrspWd = Math.min(rrspAvail, rem, rrspRoom);
@@ -281,12 +289,12 @@ export function runCoupleProjection(inputs, strategy = "optimize") {
         if (youCanWithdraw && partnerCanWithdraw) {
           const youShare = combinedTotal > 0 ? (yTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
           const partnerShare = combinedTotal > 0 ? (pTotal / combinedTotal) * portfolioNeed : portfolioNeed / 2;
-          yWd = allocateSpendingWithdrawals(youShare, grossEstimate, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, youAlive, youRetired);
-          pWd = allocateSpendingWithdrawals(partnerShare, grossEstimate, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partnerAlive, partnerRetired);
+          yWd = allocateSpendingWithdrawals(youShare, grossEstimate, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, youAlive, youRetired, yNrGainFrac);
+          pWd = allocateSpendingWithdrawals(partnerShare, grossEstimate, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partnerAlive, partnerRetired, pNrGainFrac);
         } else if (youCanWithdraw) {
-          yWd = allocateSpendingWithdrawals(portfolioNeed, grossEstimate, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, youAlive, youRetired);
+          yWd = allocateSpendingWithdrawals(portfolioNeed, grossEstimate, yRrspAvail, yTfsaAvail, yNonRegAvail, ySavAvail, yOasThresh, yLocked, youFixed.oasGross, youAlive, youRetired, yNrGainFrac);
         } else if (partnerCanWithdraw) {
-          pWd = allocateSpendingWithdrawals(portfolioNeed, grossEstimate, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partnerAlive, partnerRetired);
+          pWd = allocateSpendingWithdrawals(portfolioNeed, grossEstimate, pRrspAvail, pTfsaAvail, pNonRegAvail, pSavAvail, pOasThresh, pLocked, partnerFixed.oasGross, partnerAlive, partnerRetired, pNrGainFrac);
         }
 
         // Compute per-person RRSP top-up inside iteration so its tax impact is accounted for

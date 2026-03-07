@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { calcProgressiveTax, PROVINCES, FED_BRACKETS_DEFAULT, calcPensionIncomeCredit, calcAgeCredit, AGE_CREDIT } from './tax.js';
+import { calcProgressiveTax, PROVINCES, FED_BRACKETS_DEFAULT, calcPensionIncomeCredit, calcAgeCredit, AGE_CREDIT, getIncomeForAvgTaxRate } from './tax.js';
 import { runProjection, getSmoothedIncome, getPhaseLabel } from './projection.js';
 import { DEFAULTS, getRrifMinimum } from './constants.js';
 
@@ -1053,9 +1053,8 @@ describe('Enhanced RRSP Meltdown', () => {
     expect(row60.rrspWd).toBeGreaterThan(30000); // More than just spending needs
   });
 
-  it('U2: optimize strategy uses proportional allocation across account types', () => {
-    // With balanced portfolio, optimize should draw from all three account types
-    // proportionally by balance, not sequentially (RRSP first)
+  it('U2: optimize draws Non-Reg before RRSP, TFSA last', () => {
+    // With balanced portfolio, optimize should draw Non-Reg first, then RRSP, TFSA last
     const r = runProjection(makeInputs({
       currentAge: 60, retirementAge: 60, lifeExpectancy: 90,
       rrspBal: 300000, tfsaBal: 300000, nonRegBal: 300000, savingsBal: 0,
@@ -1063,10 +1062,9 @@ describe('Enhanced RRSP Meltdown', () => {
       activeIncome: 60000, inflation: 0, postGrowth: 0,
     }), "optimize");
     const row60 = r.rows.find(row => row.age === 60);
-    // All three accounts should be drawn from (proportional, not sequential)
-    expect(row60.rrspWd).toBeGreaterThan(0);
+    // Non-reg drawn first for spending; RRSP fills tax room; TFSA preserved
     expect(row60.nrWd).toBeGreaterThan(0);
-    expect(row60.tfsaWd).toBeGreaterThan(0);
+    expect(row60.tfsaWd).toBe(0); // TFSA last — not needed when NR+RRSP cover spending
   });
 
   it('U3: spend_down still uses sequential allocation (RRSP first)', () => {
@@ -1081,6 +1079,20 @@ describe('Enhanced RRSP Meltdown', () => {
     // Sequential: RRSP covers full spending need, TFSA should be 0
     expect(row60.rrspWd).toBeGreaterThan(0);
     expect(row60.tfsaWd).toBe(0);
+  });
+
+  it('U5: getIncomeForAvgTaxRate returns correct threshold', () => {
+    const fedBpa = FED_BRACKETS_DEFAULT.bpa;
+    const fedBrk = FED_BRACKETS_DEFAULT.brackets;
+    const provBpa = PROVINCES.Ontario.bpa;
+    const provBrk = PROVINCES.Ontario.brackets;
+    const income30 = getIncomeForAvgTaxRate(0.30, fedBpa, fedBrk, provBpa, provBrk);
+    // At 30% avg rate in Ontario, income is roughly $219K
+    expect(income30).toBeGreaterThan(200000);
+    expect(income30).toBeLessThan(250000);
+    // Verify the avg rate at this income is actually ~30%
+    const tax = calcProgressiveTax(income30, fedBpa, fedBrk) + calcProgressiveTax(income30, provBpa, provBrk);
+    expect(tax / income30).toBeCloseTo(0.30, 2);
   });
 
   it('U4: large RRSP meltdown does not withdraw entire balance (infinity bracket bug)', () => {
